@@ -1,3 +1,250 @@
 문제
     실행하면 렉이 엄청 걸림 뭔가 엄청 버벅임.
     아무래도 폴더 위치를 계속 추척하는 과정에서 버벅이는 것 같음.
+        일단 왜 버벅이는지 확인해보자.
+    닫기 버튼이 없어서 끌 수가 없음.
+        끄기 버튼도 넣자.
+
+
+
+        // 👇 유니코드 및 라이브러리 설정
+#include <dwmapi.h> // DwmGetWindowAttribute 사용을 위해 필요 (헤더 상단에 추가)
+#pragma comment(lib, "dwmapi.lib") // 라이브러리 링크 (헤더 상단에 추가)
+
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <codecvt>
+#include <UIAutomation.h>
+#include <comdef.h>
+
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "uuid.lib")
+
+// --- 전역 변수 ---
+IUIAutomation* g_pAutomation = NULL;
+HWINEVENTHOOK g_hHook = NULL; // 윈도우 이동 감지 훅 핸들
+
+struct OverlayPair {
+    HWND hExplorer;       // 타겟 탐색기
+    HWND hOverlay;        // 내 메모장
+    std::wstring currentPath;
+    DWORD lastPathCheckTick;
+};
+std::vector<OverlayPair> g_overlays;
+
+const wchar_t CLASS_NAME[] = L"ExplorerMemoOverlayClass";
+const int OVERLAY_WIDTH = 250;
+const int OVERLAY_HEIGHT = 200; // 메모장이니 너무 크지 않게
+
+// --- (기존 파일 입출력 함수들은 그대로 유지) ---
+// LoadMemo, SaveMemo 함수는 기존 코드를 그대로 사용하세요.
+// (지면 관계상 생략하지만, 실제 코드에는 포함되어야 합니다)
+std::wstring LoadMemo(const std::wstring& folderPath) { /* 기존 코드 */ return L""; }
+void SaveMemo(const std::wstring& folderPath, const std::wstring& content) { /* 기존 코드 */ }
+
+// --- 오버레이 윈도우 프로시저 ---
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_CREATE: {
+        // 메모장(에디트 컨트롤) 생성
+        CreateWindowW(L"EDIT", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)101, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), NULL);
+        
+        // 폰트 설정
+        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
+        SendDlgItemMessage(hwnd, 101, WM_SETFONT, (WPARAM)hFont, TRUE);
+        return 0;
+    }
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        // 타이틀바 영역(25px) 제외하고 에디터 채우기
+        HWND hEdit = GetDlgItem(hwnd, 101);
+        MoveWindow(hEdit, 0, 25, rc.right, rc.bottom - 25, TRUE);
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        
+        // 타이틀바 영역 그리기 (드래그 핸들 역할)
+        RECT rcTitle = { 0, 0, OVERLAY_WIDTH, 25 };
+        HBRUSH brush = CreateSolidBrush(RGB(230, 230, 230)); // 연한 회색
+        FillRect(hdc, &rcTitle, brush);
+        DeleteObject(brush);
+
+        // 현재 경로 표시
+        SetBkMode(hdc, TRANSPARENT);
+        std::wstring msg = L"";
+        for (const auto& pair : g_overlays) {
+            if (pair.hOverlay == hwnd) {
+                msg = pair.currentPath.empty() ? L"경로 없음" : pair.currentPath;
+                break;
+            }
+        }
+        TextOutW(hdc, 5, 5, msg.c_str(), msg.length());
+        
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    // (WM_COMMAND 등 저장 로직은 기존 코드 활용)
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+
+void SyncOverlayPosition(const OverlayPair& pair) {
+    if (!IsWindow(pair.hExplorer)) return;
+
+    RECT rcExp;
+    // 윈도우 10/11의 투명한 그림자 영역을 제외한 '실제 눈에 보이는 테두리' 좌표를 가져옵니다.
+    HRESULT res = DwmGetWindowAttribute(pair.hExplorer, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExp, sizeof(rcExp));
+    
+    // 만약 Dwm 함수가 실패하면(구버전 윈도우 등), 일반 GetWindowRect를 씁니다.
+    if (res != S_OK) {
+        GetWindowRect(pair.hExplorer, &rcExp);
+    }
+
+    // ⭐ 위치 계산: 탐색기 "오른쪽 하단" 구석
+    // X 좌표 = 탐색기 우측 끝(Right) - 오버레이 너비 - 여백(스크롤바 고려 25px)
+    int x = rcExp.right - OVERLAY_WIDTH - 25; 
+    
+    // Y 좌표 = 탐색기 바닥(Bottom) - 오버레이 높이 - 여백(10px)
+    int y = rcExp.bottom - OVERLAY_HEIGHT - 10; 
+
+    // 화면 밖으로 나가는 경우 방지 (선택 사항)
+    // if (x < rcExp.left) x = rcExp.left; 
+
+    // 위치 적용
+    // SWP_NOACTIVATE: 메모장이 포커스를 뺏어서 탐색기 창이 비활성화되는 것을 방지
+    // SWP_NOZORDER: Z순서(앞뒤 관계)는 건드리지 않음 (깜빡임 방지)
+    SetWindowPos(pair.hOverlay, HWND_TOPMOST, x, y, OVERLAY_WIDTH, OVERLAY_HEIGHT, 
+                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOREDRAW);
+    
+    // 강제로 다시 그려서 잔상을 없앱니다.
+    // RedrawWindow(pair.hOverlay, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW); 
+}
+
+// --- 이벤트 훅 콜백 함수 (OS가 호출함) ---
+void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, 
+                           LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
+    
+    // 윈도우가 이동했거나(LOCATIONCHANGE), 크기가 변했거나, 최소/최대화 됨
+    if (event == EVENT_OBJECT_LOCATIONCHANGE && idObject == OBJID_WINDOW) {
+        // 움직인 윈도우(hwnd)가 우리가 관리하는 탐색기인지 확인
+        for (auto& pair : g_overlays) {
+            if (pair.hExplorer == hwnd) {
+                SyncOverlayPosition(pair);
+                return; // 찾았으면 처리하고 종료
+            }
+        }
+    }
+}
+
+// --- UI Automation 경로 가져오기 (기존 함수 유지) ---
+std::wstring GetExplorerPath(HWND hExplorer) { /* 기존 GetExplorerPath 함수 내용 */ return L""; }
+
+// --- 주기적 관리 (새 탐색기 감지 및 경로 업데이트) ---
+// 위치 이동은 '훅'으로 처리하지만, '새로운 탐색기가 켜지는 것'과 '폴더 이동'은 타이머로 체크하는 게 안전함
+void ManageOverlays(HINSTANCE hInstance) {
+    // 1. 죽은 탐색기 정리
+    for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
+        if (!IsWindow(it->hExplorer)) {
+            DestroyWindow(it->hOverlay);
+            it = g_overlays.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // 2. 새로운 탐색기 찾기
+    // (EnumWindows 대신 FindWindowEx로 간단히 예시, 실제론 EnumWindows가 더 정확할 수 있음)
+    HWND hCur = FindWindowW(L"CabinetWClass", NULL);
+    while (hCur) {
+        bool managed = false;
+        for (const auto& pair : g_overlays) {
+            if (pair.hExplorer == hCur) { managed = true; break; }
+        }
+        
+        if (!managed && IsWindowVisible(hCur)) {
+            // 새 오버레이 생성
+            HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, 
+                CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, 
+                NULL, NULL, hInstance, NULL);
+            
+            // 투명도 살짝 줘서 더 자연스럽게 (옵션)
+            SetLayeredWindowAttributes(hNew, 0, 240, LWA_ALPHA);
+
+            if (hNew) {
+                OverlayPair p = { hCur, hNew, L"", 0 };
+                g_overlays.push_back(p);
+                SyncOverlayPosition(p); // 생성 즉시 위치 잡기
+            }
+        }
+        hCur = FindWindowExW(NULL, hCur, L"CabinetWClass", NULL);
+    }
+
+    // 3. 경로 업데이트 (폴더 이동 감지) - 0.5초마다
+    DWORD dwNow = GetTickCount();
+    for (auto& pair : g_overlays) {
+        if (dwNow - pair.lastPathCheckTick > 500) {
+            pair.lastPathCheckTick = dwNow;
+            // UI Automation은 무거우므로 여기서만 호출
+            std::wstring path = GetExplorerPath(pair.hExplorer); 
+            if (!path.empty() && path != pair.currentPath) {
+                pair.currentPath = path;
+                // 메모 로딩 로직...
+                SetWindowText(GetDlgItem(pair.hOverlay, 101), LoadMemo(path).c_str());
+            }
+            
+            // 혹시 훅이 놓쳤을 경우를 대비해 위치 한번 더 보정
+            SyncOverlayPosition(pair); 
+        }
+    }
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    // (UIAutomation 초기화 코드 생략 - 필수!)
+    
+    // 윈도우 클래스 등록
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    // ⭐ 핵심: 윈도우 이벤트 훅 설치
+    // EVENT_OBJECT_LOCATIONCHANGE: 창이 이동하거나 크기가 변할 때 알림 수신
+    g_hHook = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, // 범위
+        NULL, WinEventProc, 0, 0, 
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    // 메시지 루프 (타이머는 경로 확인용으로 0.5초 정도로 느슨하게)
+    SetTimer(NULL, 1, 500, NULL); 
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_TIMER) {
+            ManageOverlays(hInstance);
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    if (g_hHook) UnhookWinEvent(g_hHook);
+    CoUninitialize();
+    return 0;
+}
