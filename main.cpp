@@ -24,8 +24,8 @@
 
 // --- 전역 변수 및 상수 ---
 const wchar_t CLASS_NAME[] = L"ExplorerMemoOverlayClass";
-const int OVERLAY_WIDTH = 250;
-const int OVERLAY_HEIGHT = 200;
+const int OVERLAY_WIDTH = 400;
+const int OVERLAY_HEIGHT = 600;
 #define IDC_MEMO_EDIT 101
 #define WM_UPDATE_PATH (WM_USER + 1)
 
