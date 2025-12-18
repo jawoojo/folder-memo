@@ -60,14 +60,18 @@ std::mutex g_overlayMutex;
 HWINEVENTHOOK g_hHookObject = NULL; 
 HWINEVENTHOOK g_hHookSystem = NULL; 
 
-// --- [핵심 함수 1] 경로 가져오기 (Shell API) ---
-// [Role] 탐색기 핸들(HWND)을 주면 현재 경로(C:\...)를 반환
-// [Cost] 비용이 높음 (COM 객체 생성). 따라서 꼭 필요할 때만 호출해야 함.
+// --- [핵심 함수 1] 경로 가져오기 (Window Title Matching Strategy) ---
+// [Role] 탐색기의 '창 제목'과 일치하는 탭을 찾아서 경로를 반환
+// [Advantage] 탭이 여러 개일 때, 현재 눈에 보이는(Active) 탭을 정확히 찾아냄
 std::wstring GetExplorerPath(HWND hExplorer) {
-    std::wstring path = L"";
+    std::wstring finalPath = L"";
     IShellWindows* psw = NULL;
     
-    // ShellWindows 컬렉션에서 현재 탐색기를 찾음
+    // 1. 현재 탐색기 창의 제목을 가져옵니다. (예: "다운로드")
+    wchar_t szTitle[MAX_PATH] = { 0 };
+    GetWindowTextW(hExplorer, szTitle, MAX_PATH);
+    std::wstring windowTitle = szTitle;
+
     if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, IID_IShellWindows, (void**)&psw))) {
         long count = 0;
         psw->get_Count(&count);
@@ -82,28 +86,42 @@ std::wstring GetExplorerPath(HWND hExplorer) {
                     HWND hHwnd = NULL;
                     pApp->get_HWND((LONG_PTR*)&hHwnd);
                     
-                    // 찾던 그 탐색기가 맞으면 경로 추출
+                    // 같은 창(Frame)에 속한 탭인지 확인
                     if (hHwnd == hExplorer) {
-                        BSTR bstrURL = NULL;
-                        if (SUCCEEDED(pApp->get_LocationURL(&bstrURL)) && bstrURL) {
-                            wchar_t buf[MAX_PATH];
-                            DWORD len = MAX_PATH;
-                            // file:/// 포맷을 C:\ 포맷으로 변환
-                            if (PathCreateFromUrlW(bstrURL, buf, &len, 0) == S_OK) {
-                                path = buf;
+                        BSTR bstrName = NULL;
+                        // 탭의 이름(폴더명)을 가져옵니다.
+                        if (SUCCEEDED(pApp->get_LocationName(&bstrName)) && bstrName) {
+                            std::wstring tabName = bstrName;
+                            SysFreeString(bstrName);
+
+                            // 🔥 [핵심 로직] 창 제목에 탭 이름이 포함되어 있는지 확인
+                            // 예) 창 제목: "다운로드" vs 탭 이름: "다운로드" -> 일치! (Active Tab)
+                            // 예) 창 제목: "다운로드" vs 탭 이름: "문서"     -> 불일치 (Background Tab)
+                            
+                            // (윈도우 설정에 따라 제목 뒤에 "- File Explorer"가 붙을 수 있으므로 포함 여부로 검사)
+                            if (windowTitle.find(tabName) != std::wstring::npos) {
+                                BSTR bstrURL = NULL;
+                                if (SUCCEEDED(pApp->get_LocationURL(&bstrURL)) && bstrURL) {
+                                    wchar_t buf[MAX_PATH];
+                                    DWORD len = MAX_PATH;
+                                    if (PathCreateFromUrlW(bstrURL, buf, &len, 0) == S_OK) {
+                                        finalPath = buf;
+                                    }
+                                    SysFreeString(bstrURL);
+                                }
                             }
-                            SysFreeString(bstrURL);
                         }
                     }
                     pApp->Release();
                 }
                 pDisp->Release();
             }
-            if (!path.empty()) break; // 찾았으면 루프 탈출
+            // 경로를 찾았으면 즉시 종료 (더 이상 뒤져볼 필요 없음)
+            if (!finalPath.empty()) break; 
         }
         psw->Release();
     }
-    return path;
+    return finalPath;
 }
 
 // --- [파일 입출력 헬퍼] ---
@@ -176,8 +194,10 @@ void SyncOverlayPosition(const OverlayPair& pair) {
     int x = rcExp.right - w - 25; 
     int y = rcExp.bottom - h - 10; 
 
-    // [중요] SWP_NOZORDER 플래그 없음 -> Z-Order를 갱신하여 항상 위에 표시
-    SetWindowPos(pair.hOverlay, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW); 
+    // [수정] HWND_TOPMOST를 HWND_TOP (혹은 아예 순서 변경 없음)으로 변경
+    // SWP_NOZORDER를 넣어서 "순서는 윈도우가 알아서 관리하게 놔두고 위치만 옮겨"라고 합니다.
+    // 주인(탐색기)이 움직이면 OS가 알아서 메모장을 그 위에 그려줍니다.
+    SetWindowPos(pair.hOverlay, NULL, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
     
     HWND hEdit = GetDlgItem(pair.hOverlay, IDC_MEMO_EDIT);
     if (hEdit) {
@@ -462,9 +482,16 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
                 }
             }
         }
-        // 내 탐색기가 활성화되면 메모장을 최상단으로 올림
+        
+        // 🔥 [수정됨] 범인 검거 및 삭제 완료!
+        // 기존: SetWindowPos(..., HWND_TOPMOST, ...) <-- 이 녀석이 범인입니다.
+        // 수정: 윈도우 OS의 족보 시스템(Owner-Owned)을 믿고, 우리는 아무것도 하지 않거나
+        //       위치 싱크만 살짝 맞춰줍니다. (TopMost 강제 적용 금지)
+        
         if (hOverlay) {
-            SetWindowPos(hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // 위치만 한번 맞춰줌 (혹시 모르니)
+            SyncOverlayPosition({ hwnd, hOverlay, L"", false, false }); 
+            // 경로 업데이트 체크
             PostMessage(hOverlay, WM_UPDATE_PATH, 0, 0);
         }
     }
@@ -502,9 +529,11 @@ void ManageOverlays(HINSTANCE hInstance) {
             
             // [NEW] 관리되지 않는 새 탐색기 발견!
             if (!managed) {
-                HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, 
+                // [수정] 부모 윈도우 인자에 hCur(탐색기 핸들)를 넣습니다.
+                HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_LAYERED, // WS_EX_TOPMOST 제거!
                     CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, 
-                    NULL, NULL, hInstance, NULL);
+                    hCur, // 🔥 여기가 핵심! (NULL -> hCur) 이 메모장의 주인은 탐색기라고 선언
+                    NULL, hInstance, NULL);
                 SetLayeredWindowAttributes(hNew, 0, 240, LWA_ALPHA);
 
                 if (hNew) {
