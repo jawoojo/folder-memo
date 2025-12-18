@@ -192,7 +192,7 @@ void SyncOverlayPosition(const OverlayPair& pair) {
 
     // 우측 하단 좌표 계산
     int x = rcExp.right - w - 25; 
-    int y = rcExp.bottom - h - 10; 
+    int y = rcExp.bottom - h - 25; 
 
     // [수정] HWND_TOPMOST를 HWND_TOP (혹은 아예 순서 변경 없음)으로 변경
     // SWP_NOZORDER를 넣어서 "순서는 윈도우가 알아서 관리하게 놔두고 위치만 옮겨"라고 합니다.
