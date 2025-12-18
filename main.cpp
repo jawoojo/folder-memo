@@ -21,6 +21,10 @@
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 
+// 🔥 DPI 관련
+#include <shellscalingapi.h>
+#pragma comment(lib, "shcore.lib") // shcore 라이브러리 추가 필요
+
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -175,10 +179,9 @@ void SyncOverlayPosition(const OverlayPair& pair) {
     int x = rcExp.right - w - 25; 
     int y = rcExp.bottom - h - 10; 
 
-    // 디버그: 위치 계산 확인 (활성화)
-    std::cout << "[DEBUG] Sync Pos: " << x << ", " << y << " (" << w << "x" << h << ")" << " RC: " << rcExp.left << "," << rcExp.top << "," << rcExp.right << "," << rcExp.bottom << std::endl;
+    // 🔥 [수정] 시끄러운 디버그 로그 삭제 (이제 조용히 일합니다)
+    // std::cout << "[DEBUG] Sync Pos: " << x << ", " << y << " (" << w << "x" << h << ")" << " RC: " << rcExp.left << "," << rcExp.top << "," << rcExp.right << "," << rcExp.bottom << std::endl;
 
-    // 🔥 [수정] SWP_NOZORDER 제거, SWP_SHOWWINDOW 추가
     SetWindowPos(pair.hOverlay, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     
     HWND hEdit = GetDlgItem(pair.hOverlay, IDC_MEMO_EDIT);
@@ -504,7 +507,9 @@ void ManageOverlays(HINSTANCE hInstance) {
                 DestroyWindow(it->hOverlay);
                 it = g_overlays.erase(it);
             } else {
-                SyncOverlayPosition(*it); 
+                // 🔥 [핵심 수정] 여기서 SyncOverlayPosition(*it); 를 삭제합니다!
+                // 기존 창은 건드리지 않습니다. (이벤트 훅이 알아서 하니까요)
+                // "무관심의 미학" - 살아있으면 그냥 넘어갑니다.
                 ++it;
             }
         }
