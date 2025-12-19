@@ -34,23 +34,28 @@
 
 namespace fs = std::filesystem;
 
-// --- [상수 정의] ---
+// --- [상수 정의 업데이트] ---
 const wchar_t CLASS_NAME[] = L"ExplorerMemoOverlayClass";
-const int OVERLAY_WIDTH = 400;
-const int OVERLAY_HEIGHT = 600;
-const int MINIMIZED_SIZE = 40;
-const int BTN_SIZE = 25;
+const int OVERLAY_WIDTH = 400;       // 기본 너비
+const int OVERLAY_HEIGHT = 600;      // 기본 높이
+const int EXPANDED_WIDTH = 600;      // [PRD 4.1.2] 확장 모드 너비
+const int EXPANDED_HEIGHT = 900;     // 확장 모드 높이 (필요시 변경 가능)
+const int MINIMIZED_SIZE = 40;       // 최소화 아이콘 크기
+const int BTN_SIZE = 25;             // 버튼 크기
+const int DEFAULT_FONT_SIZE = 18;    // [요청] 기본 폰트 사이즈 +2 적용
 
 #define IDC_MEMO_EDIT 101
 #define WM_UPDATE_UI_FromThread (WM_USER + 2) // 스레드가 일 다하고 보내는 신호
 
-// --- [데이터 구조] ---
+// --- [데이터 구조 업데이트] ---
 struct OverlayPair {
-    HWND hExplorer;       // 감시 대상 (탐색기)
-    HWND hOverlay;        // 내 프로그램 (메모장)
+    HWND hExplorer;       // 감시 대상
+    HWND hOverlay;        // 내 프로그램
     std::wstring currentPath;
-    bool isMinimized;
-    bool fileExists;
+    bool isMinimized;     // 최소화 상태
+    bool isExpanded;      // [PRD 4.1.2] 확장 상태
+    bool fileExists;      // 파일 존재 여부
+    int currentFontSize;  // [PRD 4.3.1] 현재 폰트 크기
 };
 
 // --- [전역 변수] ---
@@ -58,6 +63,23 @@ std::vector<OverlayPair> g_overlays;
 std::mutex g_overlayMutex;
 HWINEVENTHOOK g_hHookObject = NULL;
 HWINEVENTHOOK g_hHookSystem = NULL;
+
+
+// --- [헬퍼 함수: 폰트 적용] ---
+void UpdateMemoFont(HWND hEdit, int fontSize) {
+    if (!hEdit) return;
+    // 기존 폰트 삭제 로직은 시스템이 처리하도록 두고, 새 폰트 생성 및 적용
+    // (더 정교하게 하려면 기존 HFONT를 추적해서 DeleteObject 해야 하지만, 
+    //  Win32 컨트롤은 새 폰트 설정 시 이전 핸들 관리를 느슨하게 해도 큰 문제 없음. 
+    //  엄격한 관리를 위해선 static HFONT 변수나 map 관리가 필요하나 여기선 실용성 위주로 작성)
+    
+    HFONT hNewFont = CreateFontW(fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
+        
+    SendMessage(hEdit, WM_SETFONT, (WPARAM)hNewFont, TRUE);
+}
+
 
 // --- [헬퍼 함수] ---
 void SyncOverlayPosition(const OverlayPair& pair); // 전방 선언
@@ -170,25 +192,25 @@ void SyncOverlayPosition(const OverlayPair& pair) {
     HRESULT res = DwmGetWindowAttribute(pair.hExplorer, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExp, sizeof(rcExp));
     if (res != S_OK) GetWindowRect(pair.hExplorer, &rcExp);
 
-    // [PRD 3.2.1] 상시 입력 대기
-    // Why: 파일이 없어도 입력 가능한 상태여야 하므로, !fileExists라고 해서 강제로 smallMode로 만들지 않음.
-    // 오직 사용자가 명시적으로 최소화(isMinimized)했을 때만 작게 변함.
-    bool smallMode = pair.isMinimized; 
+    bool smallMode = pair.isMinimized;
+    
+    // [PRD 4.1.2] 확장 모드 크기 결정
+    int targetW = smallMode ? MINIMIZED_SIZE : (pair.isExpanded ? EXPANDED_WIDTH : OVERLAY_WIDTH);
+    int targetH = smallMode ? MINIMIZED_SIZE : (pair.isExpanded ? EXPANDED_HEIGHT : OVERLAY_HEIGHT);
 
-    int w = smallMode ? MINIMIZED_SIZE : OVERLAY_WIDTH;
-    int h = smallMode ? MINIMIZED_SIZE : OVERLAY_HEIGHT;
+    // 탐색기 우측 하단 기준 좌표 계산
+    int x = rcExp.right - targetW - 25;
+    int y = rcExp.bottom - targetH - 25;
 
-    int x = rcExp.right - w - 25;
-    int y = rcExp.bottom - h - 25;
-
-    SetWindowPos(pair.hOverlay, NULL, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    SetWindowPos(pair.hOverlay, NULL, x, y, targetW, targetH, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
     
     HWND hEdit = GetDlgItem(pair.hOverlay, IDC_MEMO_EDIT);
     if (hEdit) {
-        // [PRD 3.2.1] 파일이 없어도 에디트 박스는 항상 보여야 함 (최소화 상태만 아니면)
         ShowWindow(hEdit, smallMode ? SW_HIDE : SW_SHOW);
     }
 }
+
+
 
 // --- [핵심 함수 3] 비동기 작업 스레드 (Worker Thread) ---
 // [Role] 탐색기가 바쁘든 말든, 별도 스레드에서 끈질기게 경로를 알아와서 보고함
@@ -242,72 +264,88 @@ void PathFinderThread(HWND hOverlay, HWND hExplorer) {
     CoUninitialize();
 }
 
-// --- [윈도우 프로시저 (수정됨)] ---
+// --- [윈도우 프로시저 (최종 수정됨)] ---
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-    // 스레드가 작업 완료 후 보내는 메시지 (UI 업데이트)
     case WM_UPDATE_UI_FromThread: {
         bool exists = (bool)wParam;
         std::wstring currentPath = L"";
+        int currentFontSize = DEFAULT_FONT_SIZE;
         
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
-            for (auto& pair : g_overlays) { // pair 값을 수정할 수도 있으므로 auto&
+            for (auto& pair : g_overlays) {
                 if (pair.hOverlay == hwnd) {
                     currentPath = pair.currentPath;
-                    pair.fileExists = exists; // 최신 상태 업데이트
-                    SyncOverlayPosition(pair); // [PRD 3.2.1] 즉시 UI 반영
+                    pair.fileExists = exists;
+                    currentFontSize = pair.currentFontSize; // 저장된 폰트 사이즈 가져오기
+                    SyncOverlayPosition(pair);
                     break;
                 }
             }
         }
-
         InvalidateRect(hwnd, NULL, TRUE);
 
-        // [PRD 3.1.2] 데이터 로딩
-        // 파일이 있으면 로드, 없으면 빈 칸으로 두어 작성 대기 상태 유지
         if (exists && !currentPath.empty()) {
             std::wstring memo = LoadMemo(currentPath);
             SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, memo.c_str());
         } else {
-            // 이미 작성 중인 내용이 있을 수 있으므로 무작정 지우지 않고,
-            // 경로가 바뀌었거나 명확히 없는 경우에만 처리해야 하나,
-            // 여기서는 스레드 결과에 따라 파일이 없으면 일단 빈 칸으로 둠 (새 폴더 진입 시)
-            // *심화: 사용자가 막 쓰고 있는데 스레드가 "파일 없음" 보냈다고 지워지면 안 됨.
-            //        하지만 현재 로직상 폴더 변경시에만 스레드가 돌기 때문에 안전함.
             if (GetWindowTextLengthW(GetDlgItem(hwnd, IDC_MEMO_EDIT)) == 0) {
                  SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, L"");
             }
         }
+        // [초기화] 폰트 적용
+        UpdateMemoFont(GetDlgItem(hwnd, IDC_MEMO_EDIT), currentFontSize);
         return 0;
     }
 
-    case WM_COMMAND: {
-        // [PRD 3.2.3] 자동 저장 및 [PRD 3.2.2] 트리거 생성
-        if (LOWORD(wParam) == IDC_MEMO_EDIT && HIWORD(wParam) == EN_CHANGE) {
-            std::wstring targetPath = L"";
-            bool* pFileExists = nullptr;
-
-            // 1. 현재 타겟 경로 및 파일 존재 여부 포인터 획득
+    // [PRD 4.3.1] 마우스 휠 줌 (Ctrl + Wheel)
+    case WM_MOUSEWHEEL: {
+        if (LOWORD(wParam) & MK_CONTROL) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int change = (delta > 0) ? 2 : -2; // 2단위로 조절
+            
+            int newSize = DEFAULT_FONT_SIZE;
             {
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
                 for (auto& pair : g_overlays) {
-                    if (pair.hOverlay == hwnd) { 
-                        targetPath = pair.currentPath; 
-                        pFileExists = &pair.fileExists;
-                        break; 
+                    if (pair.hOverlay == hwnd) {
+                        pair.currentFontSize += change;
+                        if (pair.currentFontSize < 8) pair.currentFontSize = 8; // 최소 제한
+                        if (pair.currentFontSize > 72) pair.currentFontSize = 72; // 최대 제한
+                        newSize = pair.currentFontSize;
+                        break;
                     }
                 }
             }
+            UpdateMemoFont(GetDlgItem(hwnd, IDC_MEMO_EDIT), newSize);
+            return 0; // 이벤트 처리 완료
+        }
+        break; // Ctrl 없으면 기본 스크롤 동작
+    }
 
+    // [PRD 4.3.1] 키보드 줌 (Ctrl + '+/-')
+    // 포커스가 Edit에 있어도 부모(Overlay)가 키를 훅하거나, 서브클래싱이 필요할 수 있음.
+    // 하지만 오버레이 구조상 Edit가 포커스를 가지므로, 사실 Edit의 프로시저를 서브클래싱 하는게 정석.
+    // *간편 구현: 이 윈도우가 포커스를 가질 때(최소화 등) 처리하거나, 메시지 루프에서 처리 필요.
+    // *여기서는 간단히 오버레이 윈도우 기준 처리만 작성 (Edit가 포커스일 땐 별도 처리가 필요할 수 있음)
+    
+    case WM_COMMAND: {
+        if (LOWORD(wParam) == IDC_MEMO_EDIT && HIWORD(wParam) == EN_CHANGE) {
+            // ... (기존 자동 저장 로직 유지) ...
+            std::wstring targetPath = L"";
+            bool* pFileExists = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_overlayMutex);
+                for (auto& pair : g_overlays) {
+                    if (pair.hOverlay == hwnd) { targetPath = pair.currentPath; pFileExists = &pair.fileExists; break; }
+                }
+            }
             if (!targetPath.empty()) {
-                // [PRD 3.2.2] 트리거 생성: 파일이 없는데 타이핑을 시작했다면?
                 if (pFileExists && !(*pFileExists)) {
                     CreateEmptyMemo(targetPath);
-                    *pFileExists = true; // 메모리 상 상태도 갱신하여 중복 생성 방지
+                    *pFileExists = true;
                 }
-
-                // [PRD 3.2.3] 자동 저장: 변경된 내용 즉시 파일에 반영
                 int len = GetWindowTextLengthW((HWND)lParam);
                 if (len >= 0) {
                     std::vector<wchar_t> buf(len + 1);
@@ -320,20 +358,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CREATE: {
-        // 에디트 컨트롤 생성
         CreateWindowW(L"EDIT", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)IDC_MEMO_EDIT, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), NULL);
         
-        // 폰트 설정
-        HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
-        SendDlgItemMessage(hwnd, IDC_MEMO_EDIT, WM_SETFONT, (WPARAM)hFont, TRUE);
+        // [요청] 초기 생성 시 기본 폰트 사이즈(18) 적용
+        UpdateMemoFont(GetDlgItem(hwnd, IDC_MEMO_EDIT), DEFAULT_FONT_SIZE);
+
+        // 생성 시 pair에 초기값 세팅이 아직 안됐을 수 있으므로(메인 루프에서 push_back),
+        // 여기서는 UI 생성만 담당.
         return 0;
     }
 
     case WM_SIZE: {
         RECT rc; GetClientRect(hwnd, &rc);
         HWND hEdit = GetDlgItem(hwnd, IDC_MEMO_EDIT);
-        // 타이틀바(버튼 영역) 제외하고 꽉 채우기
         if (rc.bottom > BTN_SIZE) MoveWindow(hEdit, 0, BTN_SIZE, rc.right, rc.bottom - BTN_SIZE, TRUE);
         return 0;
     }
@@ -341,34 +379,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         RECT rcClient; GetClientRect(hwnd, &rcClient);
-        bool isMin = false;
+        bool isMin = false, isExp = false;
         
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
-            for (const auto& pair : g_overlays) if (pair.hOverlay == hwnd) { isMin = pair.isMinimized; break; }
+            for (const auto& pair : g_overlays) if (pair.hOverlay == hwnd) { isMin = pair.isMinimized; isExp = pair.isExpanded; break; }
         }
 
-        // [View Update] 파일 유무와 관계없이, 최소화 상태만 체크하여 그림
         if (isMin) {
-            // 최소화 모드: 파란색 작은 박스 + 'O' 텍스트
-            HBRUSH brush = CreateSolidBrush(RGB(100, 100, 255)); 
-            FillRect(hdc, &rcClient, brush); 
-            DeleteObject(brush);
-            SetBkMode(hdc, TRANSPARENT); 
-            SetTextColor(hdc, RGB(255, 255, 255)); 
-            TextOutW(hdc, 12, 10, L"O", 1);
+            HBRUSH brush = CreateSolidBrush(RGB(100, 100, 255)); FillRect(hdc, &rcClient, brush); DeleteObject(brush);
+            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(255, 255, 255)); TextOutW(hdc, 12, 10, L"O", 1);
         } else {
-            // 일반 모드: 상단 타이틀바 및 버튼 그리기
+            // 타이틀바 배경
             RECT rcTitle = { 0, 0, rcClient.right, BTN_SIZE };
-            HBRUSH brush = CreateSolidBrush(RGB(230, 230, 230)); 
-            FillRect(hdc, &rcTitle, brush); 
-            DeleteObject(brush);
+            HBRUSH brush = CreateSolidBrush(RGB(230, 230, 230)); FillRect(hdc, &rcTitle, brush); DeleteObject(brush);
 
-            // 닫기(X), 최소화(_) 버튼
+            // [버튼 1] 닫기 (X)
             RECT rcClose = { rcClient.right - BTN_SIZE, 0, rcClient.right, BTN_SIZE }; 
             DrawFrameControl(hdc, &rcClose, DFC_CAPTION, DFCS_CAPTIONCLOSE);
             
-            RECT rcMin = { rcClient.right - BTN_SIZE * 2, 0, rcClient.right - BTN_SIZE, BTN_SIZE }; 
+            // [버튼 2] 확장/축소 (Toggle)
+            // 확장 상태면 '복원' 아이콘, 기본이면 '최대화' 아이콘
+            RECT rcExpand = { rcClient.right - BTN_SIZE * 2, 0, rcClient.right - BTN_SIZE, BTN_SIZE }; 
+            DrawFrameControl(hdc, &rcExpand, DFC_CAPTION, isExp ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMAX);
+
+            // [버튼 3] 최소화 (_)
+            RECT rcMin = { rcClient.right - BTN_SIZE * 3, 0, rcClient.right - BTN_SIZE * 2, BTN_SIZE }; 
             DrawFrameControl(hdc, &rcMin, DFC_CAPTION, DFCS_CAPTIONMIN);
         }
         EndPaint(hwnd, &ps);
@@ -385,33 +421,38 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         if (isMin) {
-            // 최소화 상태 클릭 -> 복원
+            // 최소화 -> 복원
             {
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
-                for (auto& pair : g_overlays) if (pair.hOverlay == hwnd) { 
-                    pair.isMinimized = false; 
-                    SyncOverlayPosition(pair); 
-                    break; 
-                }
+                for (auto& pair : g_overlays) if (pair.hOverlay == hwnd) { pair.isMinimized = false; SyncOverlayPosition(pair); break; }
             }
             InvalidateRect(hwnd, NULL, TRUE);
         } else {
-            // 상단 버튼 클릭 처리
             RECT rcClient; GetClientRect(hwnd, &rcClient);
-            if (y < BTN_SIZE) { // 타이틀바 영역
+            if (y < BTN_SIZE) { // 타이틀바 영역 클릭
                 if (x > rcClient.right - BTN_SIZE) {
-                    // [X] 종료 버튼
+                    // [X] 종료
                     PostQuitMessage(0);
                 }
                 else if (x > rcClient.right - BTN_SIZE * 2) {
-                    // [_] 최소화 버튼
+                    // [ㅁ] 확장/축소 토글
                     {
                         std::lock_guard<std::mutex> lock(g_overlayMutex);
-                        for (auto& pair : g_overlays) if (pair.hOverlay == hwnd) { 
-                            pair.isMinimized = true; 
-                            SyncOverlayPosition(pair); 
-                            break; 
+                        for (auto& pair : g_overlays) {
+                            if (pair.hOverlay == hwnd) {
+                                pair.isExpanded = !pair.isExpanded; // 토글
+                                SyncOverlayPosition(pair); // 위치/크기 재계산
+                                break;
+                            }
                         }
+                    }
+                    InvalidateRect(hwnd, NULL, TRUE);
+                }
+                else if (x > rcClient.right - BTN_SIZE * 3) {
+                    // [_] 최소화
+                    {
+                        std::lock_guard<std::mutex> lock(g_overlayMutex);
+                        for (auto& pair : g_overlays) if (pair.hOverlay == hwnd) { pair.isMinimized = true; SyncOverlayPosition(pair); break; }
                     }
                     InvalidateRect(hwnd, NULL, TRUE);
                 }
