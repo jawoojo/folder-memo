@@ -102,7 +102,7 @@ struct OverlayPair {
 
     bool isMinimized;     // 메모장 최소화 여부
 
-    bool fileExists;      // folder_memo.txt 존재 여부
+    bool fileExists;      // memo.txt 존재 여부
 
 };
 
@@ -256,7 +256,7 @@ std::wstring LoadMemo(const std::wstring& folderPath) {
 
     if (folderPath.empty()) return L"";
 
-    fs::path p(folderPath); p /= L"folder_memo.txt";
+    fs::path p(folderPath); p /= L"memo.txt";
 
     if (!fs::exists(p)) return L"";
 
@@ -306,7 +306,7 @@ void SaveMemo(const std::wstring& folderPath, const std::wstring& content) {
 
     if (folderPath.empty()) return;
 
-    fs::path p(folderPath); p /= L"folder_memo.txt";
+    fs::path p(folderPath); p /= L"memo.txt";
 
 
 
@@ -344,7 +344,7 @@ void CreateEmptyMemo(const std::wstring& folderPath) {
 
     if (folderPath.empty()) return;
 
-    fs::path p(folderPath); p /= L"folder_memo.txt";
+    fs::path p(folderPath); p /= L"memo.txt";
 
     std::ofstream ofs(p); ofs.close();
 
@@ -411,337 +411,589 @@ void SyncOverlayPosition(const OverlayPair& pair) {
 }
 
 
-// [수정된 모듈] WindowProc (Total Replacement)
-// [기능] UI 이벤트 처리, 타이머 기반 지연 로딩, 파일 연동 및 자동 저장
-// [개선사항]
-// 1. Race Condition 방지: WM_TIMER를 통한 지연 업데이트 (탐색기 멈춤 해결)
-// 2. 파일명 변경: folder_memo.txt -> folder_memo.txt 반영
-// 3. 재시도 로직: 경로 로드 실패 시 재시도 수행
+
+// --- [윈도우 프로시저] 메시지 처리 ---
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+
     switch (uMsg) {
-    // ----------------------------------------------------------------------
-    // [PRD 2.3 & 3.1] 안정적 데이터 로딩을 위한 타이머 처리
-    // [Logic] WinEventProc에서 예약한 타이머가 울리면, 그때 경로 업데이트를 수행함
-    // ----------------------------------------------------------------------
-    case WM_TIMER: {
-        // 타이머 ID 2001: 경로 업데이트 예약
-        if (wParam == 2001) {
-            KillTimer(hwnd, 2001); // 1회성 실행이므로 즉시 제거
-            SendMessage(hwnd, WM_UPDATE_PATH, 0, 0); // 메인 스레드에서 안전하게 실행
-        }
-        return 0;
-    }
 
-    // ----------------------------------------------------------------------
-    // [PRD 3.2.3] 자동 저장 (Auto-Save)
-    // ----------------------------------------------------------------------
     case WM_COMMAND: {
-        // 메모 내용 변경(EN_CHANGE) 감지 시 저장
+
+        // 메모 내용이 변경되면 즉시 파일 저장 (Auto-Save)
+
         if (LOWORD(wParam) == IDC_MEMO_EDIT && HIWORD(wParam) == EN_CHANGE) {
+
             std::wstring targetPath = L"";
+
             {
+
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
+
                 for (const auto& pair : g_overlays) {
+
                     if (pair.hOverlay == hwnd) {
+
                         targetPath = pair.currentPath;
+
                         break;
+
                     }
+
                 }
+
             }
-            // 경로가 유효할 때만 저장
+
             if (!targetPath.empty()) {
+
                 int len = GetWindowTextLengthW((HWND)lParam);
+
                 if (len >= 0) {
+
                     std::vector<wchar_t> buf(len + 1);
+
                     GetWindowTextW((HWND)lParam, buf.data(), len + 1);
+
                     SaveMemo(targetPath, std::wstring(buf.data()));
+
                 }
+
             }
+
         }
+
         return 0;
+
     }
 
-    // ----------------------------------------------------------------------
-    // [PRD 3.1.1] 경로 업데이트 및 데이터 동기화 (핵심 로직)
-    // [Fix] 기존 즉시 실행 방식에서 안정성을 위해 재시도 로직 추가
-    // ----------------------------------------------------------------------
+    // [Custom Message] 경로 변경 알림 수신 시 UI 업데이트
+
     case WM_UPDATE_PATH: {
-        HWND hExplorer = NULL;
-        // 1. 내 짝꿍(탐색기) 핸들 찾기
-        {
-            std::lock_guard<std::mutex> lock(g_overlayMutex);
-            for (const auto& pair : g_overlays) {
-                if (pair.hOverlay == hwnd) {
-                    hExplorer = pair.hExplorer;
-                    break;
-                }
-            }
-        }
 
-        // 짝꿍이 없으면 종료
-        if (!IsWindow(hExplorer)) return 0;
+        std::wstring newPath = L"";
 
-        // 2. [Heavy Task] 실제 경로 계산 (COM)
-        std::wstring calculatedPath = GetExplorerPath(hExplorer);
-
-        // [Retry Logic] 탐색기가 켜지는 중이라 경로를 아직 못 내놓는 경우
-        // 1초 뒤에 다시 시도하도록 타이머 설정 (최대 재시도 횟수 제한 필요하지만 여기선 간단히 처리)
-        if (calculatedPath.empty()) {
-            SetTimer(hwnd, 2001, 1000, NULL); 
-            return 0;
-        }
-
-        // 3. 파일 존재 여부 확인 (파일명: folder_memo.txt)
         bool exists = false;
-        if (!calculatedPath.empty()) {
-            fs::path p(calculatedPath); 
-            p /= L"folder_memo.txt"; // [PRD 수정] 파일명 변경
-            exists = fs::exists(p);
-        }
 
-        // 4. 전역 데이터 갱신 (동기화)
         {
+
             std::lock_guard<std::mutex> lock(g_overlayMutex);
-            for (auto& pair : g_overlays) {
+
+            for (const auto& pair : g_overlays) {
+
                 if (pair.hOverlay == hwnd) {
-                    pair.currentPath = calculatedPath; // 진짜 경로 주입
-                    pair.fileExists = exists;          // 파일 상태 업데이트
-                    // 파일이 있으면 최소화 해제 (선택 사항)
-                    if(exists) pair.isMinimized = false; 
-                    SyncOverlayPosition(pair);         // UI 위치/상태 새로고침
+
+                    newPath = pair.currentPath;
+
+                    exists = pair.fileExists;
+
+                    SyncOverlayPosition(pair); // 상태 변경 시 위치/크기 재조정
+
                     break;
+
                 }
+
             }
+
         }
 
-        // 5. UI 다시 그리기 & 데이터 로드
-        InvalidateRect(hwnd, NULL, TRUE); 
+       
 
-        if (exists) {
-            // 파일이 있으면 내용 로드
-            std::wstring memo = LoadMemo(calculatedPath);
+        InvalidateRect(hwnd, NULL, TRUE); // 화면 다시 그리기 요청
+
+
+
+        if (!newPath.empty() && exists) {
+
+            std::wstring memo = LoadMemo(newPath);
+
             SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, memo.c_str());
-        } else {
-            // 파일이 없으면 빈 화면 (입력 대기)
-            SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, L"");
+
         }
+
         return 0;
+
     }
 
-    // ----------------------------------------------------------------------
-    // [PRD 4.1] UI 생성 및 폰트 설정
-    // ----------------------------------------------------------------------
     case WM_CREATE: {
-        // 메모 입력창 생성
+
+        // 메모 입력창(Edit Control) 생성
+
         CreateWindowW(L"EDIT", NULL,
+
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL,
+
             0, 0, 0, 0, hwnd, (HMENU)IDC_MEMO_EDIT, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), NULL);
-        
-        // 가독성을 위한 맑은 고딕 폰트 적용
+
+       
+
+        // 폰트 설정 (맑은 고딕)
+
         HFONT hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
+
         SendDlgItemMessage(hwnd, IDC_MEMO_EDIT, WM_SETFONT, (WPARAM)hFont, TRUE);
+
         return 0;
+
     }
 
-    // ----------------------------------------------------------------------
-    // [PRD 4.1] 리사이징 대응
-    // ----------------------------------------------------------------------
     case WM_SIZE: {
+
+        // 창 크기가 변하면 에디트 컨트롤 크기도 조절
+
         RECT rc; GetClientRect(hwnd, &rc);
+
         HWND hEdit = GetDlgItem(hwnd, IDC_MEMO_EDIT);
+
         if (rc.bottom > BTN_SIZE) {
+
             MoveWindow(hEdit, 0, BTN_SIZE, rc.right, rc.bottom - BTN_SIZE, TRUE);
+
         }
+
         return 0;
+
     }
 
-    // ----------------------------------------------------------------------
-    // [PRD 4.1] 상태별 커스텀 UI 드로잉 (+ 버튼, O 버튼, 타이틀바)
-    // ----------------------------------------------------------------------
     case WM_PAINT: {
+
+        // UI 그리기 (초록색 +, 파란색 O, 타이틀바 등)
+
         PAINTSTRUCT ps;
+
         HDC hdc = BeginPaint(hwnd, &ps);
+
         RECT rcClient; GetClientRect(hwnd, &rcClient);
 
+
+
         bool isMin = false;
+
         bool hasFile = false;
+
         {
+
             std::lock_guard<std::mutex> lock(g_overlayMutex);
+
             for (const auto& pair : g_overlays) {
+
                 if (pair.hOverlay == hwnd) {
+
                     isMin = pair.isMinimized;
+
                     hasFile = pair.fileExists;
+
                     break;
+
                 }
+
             }
+
         }
 
+
+
         if (!hasFile) {
+
             // [State] 파일 없음 -> 초록색 [+] 버튼
+
             HBRUSH brush = CreateSolidBrush(RGB(50, 205, 50));
+
             FillRect(hdc, &rcClient, brush);
+
             DeleteObject(brush);
+
             SetBkMode(hdc, TRANSPARENT);
+
             SetTextColor(hdc, RGB(255, 255, 255));
+
             RECT rcText = rcClient;
+
             DrawTextW(hdc, L"+", -1, &rcText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
         }
+
         else if (isMin) {
+
             // [State] 최소화 -> 파란색 [O] 버튼
+
             HBRUSH brush = CreateSolidBrush(RGB(100, 100, 255));
+
             FillRect(hdc, &rcClient, brush);
+
             DeleteObject(brush);
+
             SetBkMode(hdc, TRANSPARENT);
+
             SetTextColor(hdc, RGB(255, 255, 255));
+
             TextOutW(hdc, 12, 10, L"O", 1);
+
         }
+
         else {
-            // [State] 일반 모드 -> 상단 타이틀바 및 닫기/최소화 버튼
+
+            // [State] 일반 모드 -> 상단 타이틀바 그리기
+
             RECT rcTitle = { 0, 0, rcClient.right, BTN_SIZE };
+
             HBRUSH brush = CreateSolidBrush(RGB(230, 230, 230));
+
             FillRect(hdc, &rcTitle, brush);
+
             DeleteObject(brush);
+
+
+
+            // 닫기(X), 최소화(_) 버튼 드로잉 (Windows API 기본 제공)
 
             RECT rcClose = { rcClient.right - BTN_SIZE, 0, rcClient.right, BTN_SIZE };
+
             DrawFrameControl(hdc, &rcClose, DFC_CAPTION, DFCS_CAPTIONCLOSE);
+
             RECT rcMin = { rcClient.right - BTN_SIZE * 2, 0, rcClient.right - BTN_SIZE, BTN_SIZE };
+
             DrawFrameControl(hdc, &rcMin, DFC_CAPTION, DFCS_CAPTIONMIN);
+
         }
+
         EndPaint(hwnd, &ps);
+
         return 0;
+
     }
 
-    // ----------------------------------------------------------------------
-    // [PRD 4.2] 마우스 클릭 인터랙션 처리
-    // ----------------------------------------------------------------------
     case WM_LBUTTONDOWN: {
+
+        // 클릭 이벤트 처리 (버튼 클릭 감지)
+
         int x = LOWORD(lParam);
+
         int y = HIWORD(lParam);
+
        
+
+        // 현재 상태 스냅샷
+
         bool hasFile = false;
+
         bool isMin = false;
+
         std::wstring currentPath = L"";
-        
+
         {
+
             std::lock_guard<std::mutex> lock(g_overlayMutex);
+
             for (const auto& pair : g_overlays) {
+
                 if (pair.hOverlay == hwnd) {
+
                     hasFile = pair.fileExists;
+
                     isMin = pair.isMinimized;
+
                     currentPath = pair.currentPath;
+
                     break;
+
                 }
+
             }
+
         }
 
-        // Case 1. [+] 버튼 클릭: 파일 생성 (암시적 생성 Trigger)
+
+
+        // 1. [+] 버튼 클릭: 파일 생성
+
         if (!hasFile) {
-            // 안전하게 경로가 확보된 상태에서만 생성
-            if (!currentPath.empty()) {
-                CreateEmptyMemo(currentPath); // folder_memo.txt 생성 (Helper 함수도 파일명 수정 필요)
-                SendMessage(hwnd, WM_UPDATE_PATH, 0, 0); // 즉시 갱신
-            }
-        }
-        // Case 2. [O] 버튼 클릭: 최소화 해제
-        else if (isMin) {
+
+            CreateEmptyMemo(currentPath);
+
             {
+
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
+
                 for (auto& pair : g_overlays) {
+
                     if (pair.hOverlay == hwnd) {
+
+                        pair.fileExists = true;
+
                         pair.isMinimized = false;
+
                         SyncOverlayPosition(pair);
+
                         break;
+
                     }
+
                 }
+
             }
+
+            PostMessage(hwnd, WM_UPDATE_PATH, 0, 0);
+
+        }
+
+        // 2. [O] 버튼 클릭: 최소화 해제
+
+        else if (isMin) {
+
+            {
+
+                std::lock_guard<std::mutex> lock(g_overlayMutex);
+
+                for (auto& pair : g_overlays) {
+
+                    if (pair.hOverlay == hwnd) {
+
+                        pair.isMinimized = false;
+
+                        SyncOverlayPosition(pair);
+
+                        break;
+
+                    }
+
+                }
+
+            }
+
             InvalidateRect(hwnd, NULL, TRUE);
+
         }
-        // Case 3. 타이틀바 버튼 클릭
+
+        // 3. 타이틀바 버튼 클릭 (X, _)
+
         else {
+
             RECT rcClient; GetClientRect(hwnd, &rcClient);
-            if (y < BTN_SIZE) {
-                // [X] 닫기 (프로그램 종료)
+
+            if (y < BTN_SIZE) { // 타이틀바 영역
+
                 if (x > rcClient.right - BTN_SIZE) {
-                    PostQuitMessage(0); 
+
+                    PostQuitMessage(0); // [X] 클릭 시 프로그램 종료
+
                 }
-                // [_] 최소화 (접기)
-                else if (x > rcClient.right - BTN_SIZE * 2) {
+
+                else if (x > rcClient.right - BTN_SIZE * 2) { // [_] 클릭 시 최소화
+
                     {
+
                         std::lock_guard<std::mutex> lock(g_overlayMutex);
+
                         for (auto& pair : g_overlays) {
+
                             if (pair.hOverlay == hwnd) {
+
                                 pair.isMinimized = true;
+
                                 SyncOverlayPosition(pair);
+
                                 break;
+
                             }
+
                         }
+
                     }
+
                     InvalidateRect(hwnd, NULL, TRUE);
+
                 }
+
             }
+
         }
+
         return 0;
+
     }
 
     case WM_CTLCOLOREDIT: {
+
         HDC hdcEdit = (HDC)wParam;
+
         SetBkColor(hdcEdit, RGB(255, 255, 255));
+
         SetTextColor(hdcEdit, RGB(0, 0, 0));
+
         return (LRESULT)GetStockObject(WHITE_BRUSH);
+
     }
+
     case WM_DESTROY: return 0;
+
     }
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
+
 }
 
 
-// [수정된 모듈] WinEventProc: 안정성 우선 (Safe Delay 적용)
+
+// --- [핵심 함수 3] 이벤트 훅 콜백 (Event-Driven Logic) ---
+
+// [Role] 윈도우(OS)에서 발생하는 특정 사건을 감지하여 반응
+
+// [Efficiency] 루프를 돌지 않고, 사건이 발생했을 때만 호출되므로 CPU 사용량 최소화
+
 void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !IsWindow(hwnd)) return;
 
-    if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
-        wchar_t className[256];
-        if (GetClassNameW(hwnd, className, 256) > 0 && wcscmp(className, L"CabinetWClass") == 0) {
-            bool managed = false;
-            {
-                std::lock_guard<std::mutex> lock(g_overlayMutex);
-                for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { managed = true; break; }
+    if (idObject != OBJID_WINDOW) return;
+
+
+
+    // 1. 창 위치 변경 (이동, 리사이징)
+
+    if (event == EVENT_OBJECT_LOCATIONCHANGE) {
+
+        std::lock_guard<std::mutex> lock(g_overlayMutex);
+
+        for (const auto& pair : g_overlays) {
+
+            if (pair.hExplorer == hwnd) {
+
+                SyncOverlayPosition(pair); // 메모장도 따라감 (가벼운 연산)
+
+                return;
+
             }
 
-            if (!managed) {
-                HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_LAYERED, CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 
-                                           0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, hwnd, NULL, GetModuleHandle(NULL), NULL);
-                if (hNew) {
-                    SetLayeredWindowAttributes(hNew, 0, 240, LWA_ALPHA);
-                    {
-                        std::lock_guard<std::mutex> lock(g_overlayMutex);
-                        g_overlays.push_back({ hwnd, hNew, L"", false, false });
-                        SyncOverlayPosition(g_overlays.back());
-                    }
-                    // 🔥 [PRD 2.3 최적화] 즉시 PostMessage 대신 500ms(0.5초) 타이머를 걸어 
-                    // 탐색기가 COM 객체 등록을 마칠 때까지 기다려줍니다. (안정성 확보)
-                    SetTimer(hNew, 2001, 500, NULL); 
-                }
-            }
         }
+
     }
-    else if (event == EVENT_OBJECT_DESTROY) {
-        std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
-            if (it->hExplorer == hwnd) { DestroyWindow(it->hOverlay); it = g_overlays.erase(it); return; }
-            else ++it;
-        }
-    }
-    else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
-        std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SyncOverlayPosition(pair); break; }
-    }
+
+    // 2. 창 이름 변경 (폴더 이동 시 발생)
+
     else if (event == EVENT_OBJECT_NAMECHANGE) {
-        // 경로 변경 시에도 바로 읽지 않고 짧은 타이머(100ms)를 주어 탭 전환 등 내부 처리를 기다립니다.
-        std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SetTimer(pair.hOverlay, 2001, 100, NULL); break; }
+
+        HWND hOverlayToUpdate = NULL;
+
+        {
+
+            std::lock_guard<std::mutex> lock(g_overlayMutex);
+
+            for (const auto& pair : g_overlays) {
+
+                if (pair.hExplorer == hwnd) {
+
+                    hOverlayToUpdate = pair.hOverlay;
+
+                    break;
+
+                }
+
+            }
+
+        }
+
+        // 관리 중인 탐색기라면 경로 확인 (무거운 연산은 여기서만 수행)
+
+        if (hOverlayToUpdate) {
+
+            std::wstring path = GetExplorerPath(hwnd);
+
+            if (!path.empty()) {
+
+                fs::path p(path); p /= L"memo.txt";
+
+                bool exists = fs::exists(p);
+
+
+
+                bool needUpdate = false;
+
+                {
+
+                    std::lock_guard<std::mutex> lock(g_overlayMutex);
+
+                    for (auto& pair : g_overlays) {
+
+                        if (pair.hExplorer == hwnd) {
+
+                            // 실제 데이터가 변했을 때만 업데이트 요청
+
+                            if (pair.currentPath != path || pair.fileExists != exists) {
+
+                                pair.currentPath = path;
+
+                                pair.fileExists = exists;
+
+                                needUpdate = true;
+
+                            }
+
+                            break;
+
+                        }
+
+                    }
+
+                }
+
+                if (needUpdate) PostMessage(hOverlayToUpdate, WM_UPDATE_PATH, 0, 0);
+
+            }
+
+        }
+
     }
+
+    // 3. 창 활성화 변경 (Alt+Tab, 클릭 등)
+
+    else if (event == EVENT_SYSTEM_FOREGROUND) {
+
+        HWND hOverlay = NULL;
+
+        {
+
+            std::lock_guard<std::mutex> lock(g_overlayMutex);
+
+            for (const auto& pair : g_overlays) {
+
+                if (pair.hExplorer == hwnd) {
+
+                    hOverlay = pair.hOverlay;
+
+                    break;
+
+                }
+
+            }
+
+        }
+
+       
+
+        // 🔥 [수정됨] 범인 검거 및 삭제 완료!
+
+        // 기존: SetWindowPos(..., HWND_TOPMOST, ...) <-- 이 녀석이 범인입니다.
+
+        // 수정: 윈도우 OS의 족보 시스템(Owner-Owned)을 믿고, 우리는 아무것도 하지 않거나
+
+        //       위치 싱크만 살짝 맞춰줍니다. (TopMost 강제 적용 금지)
+
+       
+
+        if (hOverlay) {
+
+            // 위치만 한번 맞춰줌 (혹시 모르니)
+
+            SyncOverlayPosition({ hwnd, hOverlay, L"", false, false });
+
+            // 경로 업데이트 체크
+
+            PostMessage(hOverlay, WM_UPDATE_PATH, 0, 0);
+
+        }
+
+    }
+
 }
+
 
 
 // --- [관리 함수] 새 탐색기 발견 및 죽은 창 정리 ---
@@ -832,7 +1084,7 @@ void ManageOverlays(HINSTANCE hInstance) {
 
                     if (!path.empty()) {
 
-                        fs::path p(path); p /= L"folder_memo.txt";
+                        fs::path p(path); p /= L"memo.txt";
 
                         exists = fs::exists(p);
 
@@ -874,64 +1126,110 @@ typedef HRESULT (STDAPICALLTYPE *SetProcessDpiAwarenessType)(int);
 
 
 
-// [수정된 모듈] WinMain: 이벤트 리스너 최적화 (Noise Canceling 적용)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // [DPI Awareness] 및 [COM 초기화] 코드 유지
+
+    // [DPI Awareness] 고해상도 모니터 대응
+
+    // Shcore.dll을 동적으로 로드하여 실행 (없으면 무시)
+
     HMODULE hShCore = LoadLibrary(L"Shcore.dll");
+
     if (hShCore) {
+
         auto pSetProcessDpiAwareness = (SetProcessDpiAwarenessType)GetProcAddress(hShCore, "SetProcessDpiAwareness");
-        if (pSetProcessDpiAwareness) pSetProcessDpiAwareness(2);
+
+        if (pSetProcessDpiAwareness) {
+
+            pSetProcessDpiAwareness(2); // PROCESS_PER_MONITOR_DPI_AWARE
+
+        }
+
         FreeLibrary(hShCore);
+
     }
+
+
+
+    // COM 초기화 (Shell API 사용을 위해 필수)
+
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
+
+
     // 윈도우 클래스 등록
+
     WNDCLASSW wc = { 0 };
+
     wc.lpfnWndProc = WindowProc;
+
     wc.hInstance = hInstance;
+
     wc.lpszClassName = CLASS_NAME;
+
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+
     RegisterClassW(&wc);
 
-    // ---------------------------------------------------------
-    // [Hooks] Eco-Friendly Event Listeners (노이즈 캔슬링 적용)
-    // ---------------------------------------------------------
-    // 이유: 모든 이벤트를 다 들으면(EVENT_MIN~MAX) 프로그램이 멈춥니다.
-    // 해결: 필요한 신호만 골라 듣는 '핀셋 설정'을 적용합니다.
 
-    // 1. [생성/소멸] 창이 열리고 닫히는 것만 감지 (0x8000 ~ 0x8001)
-    HWINEVENTHOOK hHook1 = SetWinEventHook(
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-        NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    // 2. [상태 변경] 위치 이동, 이름 변경만 감지 (0x800B ~ 0x800C)
-    // 중간에 있는 EVENT_OBJECT_STATECHANGE(마우스 오버 등) 같은 시끄러운 이벤트를 건너뜁니다.
-    HWINEVENTHOOK hHook2 = SetWinEventHook(
+    // [Hooks] 이벤트 리스너 설치 (가장 중요한 부분)
+
+    // 1. 객체 변경 (이동, 이름변경) 감지
+
+    g_hHookObject = SetWinEventHook(
+
         EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
+
         NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    // 3. [포커스] 창 활성화 감지 (0x0003)
-    HWINEVENTHOOK hHook3 = SetWinEventHook(
+
+
+    // 2. 시스템 상태 (포커스) 감지
+
+    g_hHookSystem = SetWinEventHook(
+
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+
         NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    // 전역 변수에 저장 (나중에 해제하기 위함)
-    g_hHookObject = hHook1; // 임시로 하나만 저장하거나, 벡터로 관리 추천 (여기선 간단히)
-    // *실제 코드에서는 종료 시 UnhookWinEvent를 hHook1, hHook2, hHook3 모두 해야 합니다.
-    //  편의상 메인 루프 뒤에 3개 다 해제하는 코드를 넣으세요.
+
+
+    // 타이머 시작 (새 창 발견용 - 0.5초 간격)
+
+    SetTimer(NULL, 1, 500, NULL);
+
+
 
     // 메시지 루프
+
     MSG msg;
+
     while (GetMessage(&msg, NULL, 0, 0)) {
+
+        if (msg.message == WM_TIMER) {
+
+            ManageOverlays(hInstance);
+
+        }
+
         TranslateMessage(&msg);
+
         DispatchMessage(&msg);
+
     }
 
+
+
     // 종료 및 정리
-    if (hHook1) UnhookWinEvent(hHook1);
-    if (hHook2) UnhookWinEvent(hHook2);
-    if (hHook3) UnhookWinEvent(hHook3);
+
+    if (g_hHookObject) UnhookWinEvent(g_hHookObject);
+
+    if (g_hHookSystem) UnhookWinEvent(g_hHookSystem);
+
     CoUninitialize();
+
     return 0;
+
 }
