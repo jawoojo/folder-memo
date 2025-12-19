@@ -386,7 +386,7 @@ void SyncOverlayPosition(const OverlayPair& pair) {
 
     int x = rcExp.right - w - 25;
 
-    int y = rcExp.bottom - h - 10;
+    int y = rcExp.bottom - h - 25;
 
 
 
@@ -695,11 +695,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 
-// [수정된 모듈] WinEventProc: 안정성 우선 (Safe Delay 적용)
+// [수정된 모듈] WinEventProc: 좀비 프로세스 방지 및 정확한 종료 감지
 void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !IsWindow(hwnd)) return;
+    // 1. 기본적인 필터링 (윈도우 객체만 처리)
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
+    // 🔴 [수정 포인트] !IsWindow(hwnd) 체크를 여기서 하지 않습니다.
+    // 죽어가는 창(Destroy)의 신호를 무시하게 되기 때문입니다.
+
+    // ---------------------------------------------------------
+    // Case 1: 새로운 탐색기 발견 (생성)
+    // ---------------------------------------------------------
     if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
+        // 생성 시에는 유효한 창인지 확인 필수
+        if (!IsWindow(hwnd)) return;
+
         wchar_t className[256];
         if (GetClassNameW(hwnd, className, 256) > 0 && wcscmp(className, L"CabinetWClass") == 0) {
             bool managed = false;
@@ -709,6 +719,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
             }
 
             if (!managed) {
+                // 부모 윈도우 설정 및 투명창 생성
                 HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_LAYERED, CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 
                                            0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, hwnd, NULL, GetModuleHandle(NULL), NULL);
                 if (hNew) {
@@ -718,28 +729,64 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
                         g_overlays.push_back({ hwnd, hNew, L"", false, false });
                         SyncOverlayPosition(g_overlays.back());
                     }
-                    // 🔥 [PRD 2.3 최적화] 즉시 PostMessage 대신 500ms(0.5초) 타이머를 걸어 
-                    // 탐색기가 COM 객체 등록을 마칠 때까지 기다려줍니다. (안정성 확보)
+                    // 안정적인 연동을 위한 0.5초 지연 타이머
                     SetTimer(hNew, 2001, 500, NULL); 
                 }
             }
         }
     }
+    // ---------------------------------------------------------
+    // Case 2: 탐색기 종료 감지 (청소)
+    // ---------------------------------------------------------
     else if (event == EVENT_OBJECT_DESTROY) {
+        // 여기서 IsWindow를 체크하면 안 됩니다. (이미 죽었을 수 있음)
+        
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
-            if (it->hExplorer == hwnd) { DestroyWindow(it->hOverlay); it = g_overlays.erase(it); return; }
-            else ++it;
+            // 조건 1: 파괴된 핸들이 내가 관리하던 탐색기인가? (hwnd == it->hExplorer)
+            // 조건 2: 혹은 내가 관리하던 탐색기가 OS 상에서 사라졌는가? (!IsWindow) -> 좀비 청소
+            if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) {
+                // 짝꿍 메모장 파괴
+                DestroyWindow(it->hOverlay);
+                // 리스트에서 제거
+                it = g_overlays.erase(it);
+                // 한 번에 하나만 처리하지 않고, 혹시 모를 다중 종료를 대비해 계속 검사할 수도 있으나
+                // 효율성을 위해 여기선 리턴하되, 좀비 청소를 위해 루프를 돌게 할 수도 있음.
+                // 여기서는 안전하게 루프를 계속 돕니다.
+                continue; 
+            }
+            ++it;
         }
     }
+    // ---------------------------------------------------------
+    // Case 3: 위치 이동 및 활성화 (업데이트)
+    // ---------------------------------------------------------
     else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
+        // 이동/활성화 시에는 윈도우가 살아있어야 함
+        if (!IsWindow(hwnd)) return; 
+
         std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SyncOverlayPosition(pair); break; }
+        for (const auto& pair : g_overlays) {
+            if (pair.hExplorer == hwnd) { 
+                SyncOverlayPosition(pair); 
+                break; 
+            }
+        }
     }
+    // ---------------------------------------------------------
+    // Case 4: 이름(경로) 변경
+    // ---------------------------------------------------------
     else if (event == EVENT_OBJECT_NAMECHANGE) {
-        // 경로 변경 시에도 바로 읽지 않고 짧은 타이머(100ms)를 주어 탭 전환 등 내부 처리를 기다립니다.
+        if (!IsWindow(hwnd)) return;
+
         std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SetTimer(pair.hOverlay, 2001, 100, NULL); break; }
+        for (const auto& pair : g_overlays) {
+            if (pair.hExplorer == hwnd) { 
+                // 탭 전환 등의 딜레이를 고려하여 0.1초 뒤 업데이트 요청
+                SetTimer(pair.hOverlay, 2001, 100, NULL); 
+                break; 
+            }
+        }
     }
 }
 
