@@ -471,12 +471,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-
-// --- [Event Hook] ---
+// --- [Event Hook 수정됨] ---
 void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
-    // Case 1: 새로운 탐색기 발견
+    // Case 1: 생성 (기존 동일)
     if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
         if (!IsWindow(hwnd)) return;
         wchar_t className[256];
@@ -486,49 +485,56 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
                 for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { managed = true; break; }
             }
-
             if (!managed) {
+                // 탐색기를 Owner(부모)로 지정하여 윈도우가 OS 차원에서 묶이도록 함
                 HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_LAYERED, CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 
                                            0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, hwnd, NULL, GetModuleHandle(NULL), NULL);
                 if (hNew) {
                     SetLayeredWindowAttributes(hNew, 0, 240, LWA_ALPHA);
+                    UpdateMemoFont(GetDlgItem(hNew, IDC_MEMO_EDIT), DEFAULT_FONT_SIZE);
                     {
                         std::lock_guard<std::mutex> lock(g_overlayMutex);
-                        g_overlays.push_back({ hwnd, hNew, L"", false, false });
+                        g_overlays.push_back({ hwnd, hNew, L"", false, false, false, DEFAULT_FONT_SIZE });
                         SyncOverlayPosition(g_overlays.back());
                     }
-                    
-                    // 🔥 [핵심] 타이머(SetTimer) 대신 별도의 스레드를 출발시킵니다.
-                    // 탐색기가 1초 걸리든 10초 걸리든, 이 스레드가 알아서 기다렸다가 보고합니다.
-                    // detach()를 하면 백그라운드에서 알아서 돌고 사라집니다.
                     std::thread(PathFinderThread, hNew, hwnd).detach();
                 }
             }
         }
     }
-    // Case 2: 탐색기 종료 (좀비 청소)
-    else if (event == EVENT_OBJECT_DESTROY) {
+    // 🔥 [최적화 핵심] Case 2: 숨김 또는 파괴 (Hide OR Destroy)
+    // 탐색기가 닫힐 때 OS는 Hide -> Destroy 순서로 신호를 보냄.
+    // Destroy만 기다리면 늦음. Hide가 오자마자 우리도 같이 숨어야 함.
+    else if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) {
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
-            // IsWindow 체크를 !연산자로 하여 죽은 창도 감지
-            if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) { 
-                DestroyWindow(it->hOverlay); 
-                it = g_overlays.erase(it); 
-                continue; 
+            // 이벤트 대상이 내 탐색기이거나, 이미 죽은 탐색기라면
+            if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) {
+                
+                // 1. 시각적 즉시 처리 (Visual Feedback)
+                // 메모리 해제고 뭐고 일단 눈앞에서 치움 -> 사용자 체감 속도 0ms
+                ShowWindow(it->hOverlay, SW_HIDE);
+
+                // 2. 리소스 정리 (Cleanup)
+                // 만약 진짜 파괴 이벤트거나 윈도우가 죽었으면 데이터 삭제
+                if (event == EVENT_OBJECT_DESTROY || !IsWindow(it->hExplorer)) {
+                    DestroyWindow(it->hOverlay); 
+                    it = g_overlays.erase(it); 
+                    continue; 
+                }
             }
             ++it;
         }
     }
-    // Case 3: 위치/활성화
+    // Case 3: 위치 변경 등 (기존 동일)
     else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
         if (!IsWindow(hwnd)) return; 
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SyncOverlayPosition(pair); break; }
     }
-    // Case 4: 이름 변경
+    // Case 4: 이름 변경 (기존 동일)
     else if (event == EVENT_OBJECT_NAMECHANGE) {
         if (!IsWindow(hwnd)) return;
-        // 이름 변경 시에도 스레드를 보내서 확인합니다. (메인 스레드 보호)
         HWND hOverlay = NULL;
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
@@ -540,40 +546,86 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
 
 // --- [Main] ---
 typedef HRESULT (STDAPICALLTYPE *SetProcessDpiAwarenessType)(int);
+// [2.1.3] & [2.2.3] 메인 엔트리 포인트: OS 이벤트 훅 설정 및 메시지 루프
+// 수정 사항: 감지 범위를 HIDE까지 확장하여 반응성 개선 (Polling-Free)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    // 1. DPI 인식 설정 (High-DPI 모니터 대응)
     HMODULE hShCore = LoadLibrary(L"Shcore.dll");
     if (hShCore) {
         auto pSetProcessDpiAwareness = (SetProcessDpiAwarenessType)GetProcAddress(hShCore, "SetProcessDpiAwareness");
-        if (pSetProcessDpiAwareness) pSetProcessDpiAwareness(2);
+        if (pSetProcessDpiAwareness) pSetProcessDpiAwareness(2); // PROCESS_PER_MONITOR_DPI_AWARE
         FreeLibrary(hShCore);
     }
-    // 메인 스레드 COM 초기화
+    
+    // COM 라이브러리 초기화
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
+    // 2. 윈도우 클래스 등록 (메모장 오버레이용)
     WNDCLASSW wc = { 0 };
-    wc.lpfnWndProc = WindowProc;
+    wc.lpfnWndProc = WindowProc;        // 메시지 처리 함수 연결
     wc.hInstance = hInstance;
-    wc.lpszClassName = CLASS_NAME;
+    wc.lpszClassName = CLASS_NAME;      // "FolderMemoOverlay"
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
-    // 이벤트 훅 설치 (범위를 나누어 노이즈 캔슬링)
-    HWINEVENTHOOK hHook1 = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    HWINEVENTHOOK hHook2 = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    HWINEVENTHOOK hHook3 = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    // -------------------------------------------------------------------------
+    // 3. [최적화 핵심] WinEventHook 설치 (Event-Driven Architecture)
+    // -------------------------------------------------------------------------
+    
+    // Hook 1: 탐색기 생성(Create) ~ 숨김(Hide) 감지
+    // 설명: 기존 Destroy(0x8001)까지만 감지하던 것을 Hide(0x8003)까지 확장했습니다.
+    // 효과: 탐색기 창을 닫거나 숨길 때, 메모장이 '즉시' 반응하여 사라집니다. (CPU 낭비 제거)
+    HWINEVENTHOOK hHook1 = SetWinEventHook(
+        EVENT_OBJECT_CREATE,        // 시작: 생성됨
+        EVENT_OBJECT_HIDE,          // 끝: 숨겨짐 (여기까지 감지해야 닫기 반응이 빠름)
+        NULL, 
+        WinEventProc, 
+        0, 
+        0, 
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+    
+    // Hook 2: 위치 변경 및 경로(이름) 변경 감지
+    // 설명: 탐색기가 이동하거나 다른 폴더로 이동했을 때만 로직을 수행합니다. (Lazy Evaluation)
+    HWINEVENTHOOK hHook2 = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, 
+        EVENT_OBJECT_NAMECHANGE, 
+        NULL, 
+        WinEventProc, 
+        0, 
+        0, 
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
 
+    // Hook 3: 활성화(포커스) 변경 감지
+    // 설명: Z-Order 동기화를 위해 포그라운드 변경 시점만 정확히 잡아냅니다.
+    HWINEVENTHOOK hHook3 = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, 
+        EVENT_SYSTEM_FOREGROUND, 
+        NULL, 
+        WinEventProc, 
+        0, 
+        0, 
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+
+    // 전역 변수에 메인 훅 핸들 저장 (필요 시 참조용)
     g_hHookObject = hHook1;
 
+    // 4. 메시지 루프 (Pollling 아님, OS 메시지 대기)
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
+    // 5. 종료 및 정리 (리소스 반환)
     if (hHook1) UnhookWinEvent(hHook1);
     if (hHook2) UnhookWinEvent(hHook2);
     if (hHook3) UnhookWinEvent(hHook3);
+    
     CoUninitialize();
+    
     return 0;
 }
