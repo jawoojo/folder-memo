@@ -29,33 +29,36 @@
 #include <mutex>
 #include <filesystem>
 #include <fstream>
-#include <thread> // 🔥 [핵심] 비동기 처리를 위한 헤더
-#include <chrono> // 시간 지연용
+#include <thread>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
 // --- [상수 정의 업데이트] ---
 const wchar_t CLASS_NAME[] = L"ExplorerMemoOverlayClass";
-const int OVERLAY_WIDTH = 400;       // 기본 너비
-const int OVERLAY_HEIGHT = 600;      // 기본 높이
-const int EXPANDED_WIDTH = 600;      // [PRD 4.1.2] 확장 모드 너비
-const int EXPANDED_HEIGHT = 900;     // 확장 모드 높이 (필요시 변경 가능)
-const int MINIMIZED_SIZE = 40;       // 최소화 아이콘 크기
-const int BTN_SIZE = 25;             // 버튼 크기
-const int DEFAULT_FONT_SIZE = 20;    // [요청] 기본 폰트 사이즈 +2 적용
+const int OVERLAY_WIDTH = 400;       
+const int OVERLAY_HEIGHT = 600;      
+const int EXPANDED_WIDTH = 600;      
+const int EXPANDED_HEIGHT = 900;     
+const int MINIMIZED_SIZE = 50;       // 🔥 [디자인] 최소화 크기 40 -> 50으로 변경
+const int BTN_SIZE = 25;             
+const int DEFAULT_FONT_SIZE = 20;    
+
+// 🔥 [디자인] 배경색 정의 (눈이 편한 연회색 #F3F3F3)
+const COLORREF BG_COLOR = RGB(243, 243, 243);
 
 #define IDC_MEMO_EDIT 101
-#define WM_UPDATE_UI_FromThread (WM_USER + 2) // 스레드가 일 다하고 보내는 신호
+#define WM_UPDATE_UI_FromThread (WM_USER + 2)
 
-// --- [데이터 구조 업데이트] ---
+// --- [데이터 구조] ---
 struct OverlayPair {
-    HWND hExplorer;       // 감시 대상
-    HWND hOverlay;        // 내 프로그램
+    HWND hExplorer;
+    HWND hOverlay;
     std::wstring currentPath;
-    bool isMinimized;     // 최소화 상태
-    bool isExpanded;      // [PRD 4.1.2] 확장 상태
-    bool fileExists;      // 파일 존재 여부
-    int currentFontSize;  // [PRD 4.3.1] 현재 폰트 크기
+    bool isMinimized;
+    bool isExpanded;
+    bool fileExists;
+    int currentFontSize;
 };
 
 // --- [전역 변수] ---
@@ -64,32 +67,22 @@ std::mutex g_overlayMutex;
 HWINEVENTHOOK g_hHookObject = NULL;
 HWINEVENTHOOK g_hHookSystem = NULL;
 
-
 // --- [헬퍼 함수: 폰트 적용] ---
 void UpdateMemoFont(HWND hEdit, int fontSize) {
     if (!hEdit) return;
-    // 기존 폰트 삭제 로직은 시스템이 처리하도록 두고, 새 폰트 생성 및 적용
-    // (더 정교하게 하려면 기존 HFONT를 추적해서 DeleteObject 해야 하지만, 
-    //  Win32 컨트롤은 새 폰트 설정 시 이전 핸들 관리를 느슨하게 해도 큰 문제 없음. 
-    //  엄격한 관리를 위해선 static HFONT 변수나 map 관리가 필요하나 여기선 실용성 위주로 작성)
-    
     HFONT hNewFont = CreateFontW(fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
-        
     SendMessage(hEdit, WM_SETFONT, (WPARAM)hNewFont, TRUE);
 }
 
-
 // --- [헬퍼 함수] ---
-void SyncOverlayPosition(const OverlayPair& pair); // 전방 선언
+void SyncOverlayPosition(const OverlayPair& pair); 
 
 // --- [핵심 함수 1] 경로 가져오기 (COM) ---
-// 주의: 이 함수는 이제 메인 스레드가 아니라 '작업 스레드'에서 호출됩니다.
 std::wstring GetExplorerPath(HWND hExplorer) {
     std::wstring finalPath = L"";
     IShellWindows* psw = NULL;
-
     wchar_t szTitle[MAX_PATH] = { 0 };
     GetWindowTextW(hExplorer, szTitle, MAX_PATH);
     std::wstring windowTitle = szTitle;
@@ -97,7 +90,6 @@ std::wstring GetExplorerPath(HWND hExplorer) {
     if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, IID_IShellWindows, (void**)&psw))) {
         long count = 0;
         psw->get_Count(&count);
-        
         for (long i = 0; i < count; i++) {
             VARIANT v; v.vt = VT_I4; v.lVal = i;
             IDispatch* pDisp = NULL;
@@ -116,9 +108,7 @@ std::wstring GetExplorerPath(HWND hExplorer) {
                                 if (SUCCEEDED(pApp->get_LocationURL(&bstrURL)) && bstrURL) {
                                     wchar_t buf[MAX_PATH];
                                     DWORD len = MAX_PATH;
-                                    if (PathCreateFromUrlW(bstrURL, buf, &len, 0) == S_OK) {
-                                        finalPath = buf;
-                                    }
+                                    if (PathCreateFromUrlW(bstrURL, buf, &len, 0) == S_OK) finalPath = buf;
                                     SysFreeString(bstrURL);
                                 }
                             }
@@ -143,7 +133,6 @@ std::wstring LoadMemo(const std::wstring& folderPath) {
 
     HANDLE hFile = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return L"";
-
     DWORD fileSize = GetFileSize(hFile, NULL);
     if (fileSize == 0) { CloseHandle(hFile); return L""; }
 
@@ -152,7 +141,6 @@ std::wstring LoadMemo(const std::wstring& folderPath) {
     ReadFile(hFile, buffer.data(), fileSize, &bytesRead, NULL);
     buffer[bytesRead] = '\0';
     CloseHandle(hFile);
-
     int wlen = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), -1, NULL, 0);
     if (wlen == 0) return L"";
     std::vector<wchar_t> wbuf(wlen);
@@ -163,10 +151,8 @@ std::wstring LoadMemo(const std::wstring& folderPath) {
 void SaveMemo(const std::wstring& folderPath, const std::wstring& content) {
     if (folderPath.empty()) return;
     fs::path p(folderPath); p /= L"folder_memo.txt";
-
     HANDLE hFile = CreateFileW(p.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
-
     int len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), -1, NULL, 0, NULL, NULL);
     if (len > 0) {
         std::vector<char> buf(len);
@@ -184,17 +170,14 @@ void CreateEmptyMemo(const std::wstring& folderPath) {
     std::ofstream ofs(p); ofs.close();
 }
 
-// --- [핵심 함수 2] 위치 동기화 (수정됨) ---
+// --- [핵심 함수 2] 위치 동기화 ---
 void SyncOverlayPosition(const OverlayPair& pair) {
     if (!IsWindow(pair.hExplorer)) return;
-
     RECT rcExp;
     HRESULT res = DwmGetWindowAttribute(pair.hExplorer, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExp, sizeof(rcExp));
     if (res != S_OK) GetWindowRect(pair.hExplorer, &rcExp);
 
     bool smallMode = pair.isMinimized;
-    
-    // [PRD 4.1.2] 확장 모드 크기 결정
     int targetW = smallMode ? MINIMIZED_SIZE : (pair.isExpanded ? EXPANDED_WIDTH : OVERLAY_WIDTH);
     int targetH = smallMode ? MINIMIZED_SIZE : (pair.isExpanded ? EXPANDED_HEIGHT : OVERLAY_HEIGHT);
 
@@ -203,47 +186,26 @@ void SyncOverlayPosition(const OverlayPair& pair) {
     int y = rcExp.bottom - targetH - 25;
 
     SetWindowPos(pair.hOverlay, NULL, x, y, targetW, targetH, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
-    
     HWND hEdit = GetDlgItem(pair.hOverlay, IDC_MEMO_EDIT);
-    if (hEdit) {
-        ShowWindow(hEdit, smallMode ? SW_HIDE : SW_SHOW);
-    }
+    if (hEdit) ShowWindow(hEdit, smallMode ? SW_HIDE : SW_SHOW);
 }
 
-
-
-// --- [핵심 함수 3] 비동기 작업 스레드 (Worker Thread) ---
-// [Role] 탐색기가 바쁘든 말든, 별도 스레드에서 끈질기게 경로를 알아와서 보고함
+// --- [핵심 함수 3] 비동기 작업 스레드 ---
 void PathFinderThread(HWND hOverlay, HWND hExplorer) {
-    // 1. 스레드별 COM 초기화 (필수)
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
-
     std::wstring foundPath = L"";
-    
-    // [Retry Policy] 최대 5번 시도, 시도 간격 0.3초
-    // 탐색기 탭 분리 등 대공사 중일 때를 대비해 조금 기다려줌 (Polling 아님, Retry임)
     for (int i = 0; i < 5; i++) {
-        // 탐색기 핸들이 유효한지 체크
         if (!IsWindow(hExplorer)) break;
-
-        // 경로 추출 시도 (여기서 탐색기가 멈춰있으면 이 스레드만 멈춤. 메인 프로그램은 안전!)
         foundPath = GetExplorerPath(hExplorer);
-
-        if (!foundPath.empty()) break; // 찾았으면 탈출
-
-        // 못 찾았으면(탐색기 부팅중) 잠시 대기 후 재시도
+        if (!foundPath.empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
-
-    // 2. 결과 처리 (경로를 찾았든 못 찾았든 보고)
     if (IsWindow(hOverlay)) {
         bool exists = false;
         if (!foundPath.empty()) {
             fs::path p(foundPath); p /= L"folder_memo.txt";
             exists = fs::exists(p);
         }
-
-        // [Critical Section] 전역 데이터 업데이트
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
             for (auto& pair : g_overlays) {
@@ -251,27 +213,22 @@ void PathFinderThread(HWND hOverlay, HWND hExplorer) {
                     pair.currentPath = foundPath;
                     pair.fileExists = exists;
                     if (exists) pair.isMinimized = false;
-                    // 여기서 위치 싱크를 맞추는 건 메인 스레드에게 맡김 (안전하게)
                     break;
                 }
             }
         }
-
-        // 3. 메인 스레드에게 "작업 끝났다"고 알림
         PostMessage(hOverlay, WM_UPDATE_UI_FromThread, (WPARAM)exists, 0);
     }
-
     CoUninitialize();
 }
 
-// --- [윈도우 프로시저 (최종: 플랫 버튼 + 모던 그레이 테두리 + 스크롤바 복구)] ---
+// --- [윈도우 프로시저 (디자인 수정 완료)] ---
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_UPDATE_UI_FromThread: {
         bool exists = (bool)wParam;
         std::wstring currentPath = L"";
         int currentFontSize = DEFAULT_FONT_SIZE;
-        
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
             for (auto& pair : g_overlays) {
@@ -285,7 +242,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
         }
         InvalidateRect(hwnd, NULL, TRUE);
-
         if (exists && !currentPath.empty()) {
             std::wstring memo = LoadMemo(currentPath);
             SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, memo.c_str());
@@ -298,7 +254,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
     case WM_MOUSEWHEEL: {
         if (LOWORD(wParam) & MK_CONTROL) {
-            // [Ctrl + 휠] 폰트 줌
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             int change = (delta > 0) ? 2 : -2; 
             int newSize = DEFAULT_FONT_SIZE;
@@ -317,7 +272,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             UpdateMemoFont(GetDlgItem(hwnd, IDC_MEMO_EDIT), newSize);
             return 0; 
         }
-        // Ctrl 없을 땐 기본 스크롤 동작 (메시지 전달)
         HWND hEdit = GetDlgItem(hwnd, IDC_MEMO_EDIT);
         if (hEdit) SendMessage(hEdit, uMsg, wParam, lParam);
         break; 
@@ -350,10 +304,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CREATE: {
-        // [수정] 스크롤바(WS_VSCROLL) 정식 부활
         CreateWindowW(L"EDIT", NULL, WS_CHILD | WS_VISIBLE | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)IDC_MEMO_EDIT, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), NULL);
-        
         UpdateMemoFont(GetDlgItem(hwnd, IDC_MEMO_EDIT), DEFAULT_FONT_SIZE);
         return 0;
     }
@@ -361,14 +313,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     case WM_SIZE: {
         RECT rc; GetClientRect(hwnd, &rc);
         HWND hEdit = GetDlgItem(hwnd, IDC_MEMO_EDIT);
-        
         if (rc.bottom > BTN_SIZE) {
-            // [수정] 트릭 제거하고 정석대로 배치
-            // 테두리(1px) 안쪽에 예쁘게 들어가도록 좌표 조정
-            // Left: 1, Top: BTN_SIZE+1, Width: rc.right-2, Height: rc.bottom - BTN_SIZE - 2
             MoveWindow(hEdit, 1, BTN_SIZE + 1, rc.right - 2, rc.bottom - BTN_SIZE - 2, TRUE);
-            
-            // 마진 초기화 (이전 트릭 잔재 제거)
             SendMessage(hEdit, EM_SETMARGINS, EC_RIGHTMARGIN, MAKELPARAM(0, 0));
         }
         return 0;
@@ -378,50 +324,66 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         RECT rcClient; GetClientRect(hwnd, &rcClient);
         bool isMin = false, isExp = false;
-        
         {
             std::lock_guard<std::mutex> lock(g_overlayMutex);
             for (const auto& pair : g_overlays) if (pair.hOverlay == hwnd) { isMin = pair.isMinimized; isExp = pair.isExpanded; break; }
         }
 
-        // 전체 배경 흰색 (투명도 적용됨)
-        HBRUSH hWhiteBrush = (HBRUSH)GetStockObject(WHITE_BRUSH);
-        FillRect(hdc, &rcClient, hWhiteBrush);
+        // 🔥 [디자인 수정] 배경색을 #F3F3F3(연회색)으로 채움
+        HBRUSH hBgBrush = CreateSolidBrush(BG_COLOR);
+        FillRect(hdc, &rcClient, hBgBrush);
+        DeleteObject(hBgBrush);
 
         if (isMin) {
-            // 최소화 상태 아이콘 (O)
-            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(50, 50, 50)); 
-            TextOutW(hdc, 12, 10, L"O", 1);
+            // 🔥 [디자인 수정] 최소화 아이콘 (▤) 그리기
+            // 50px 박스 안에 꽉 차게 폰트 크기 조정
+            HFONT hIconFont = CreateFontW(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
+                DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
+            
+            HFONT hOldFont = (HFONT)SelectObject(hdc, hIconFont);
+            SetBkMode(hdc, TRANSPARENT); 
+            SetTextColor(hdc, RGB(50, 50, 50)); 
+            
+            // 중앙 정렬하여 ▤ 출력
+            RECT rcIcon = rcClient;
+            DrawTextW(hdc, L"▤", -1, &rcIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            
+            SelectObject(hdc, hOldFont);
+            DeleteObject(hIconFont);
+
+            // 최소화 상태에서도 테두리 그리기
+            HBRUSH hBorderBrush = CreateSolidBrush(RGB(100, 100, 100)); 
+            FrameRect(hdc, &rcClient, hBorderBrush);
+            DeleteObject(hBorderBrush);
+
         } else {
-            // --- 플랫 버튼 그리기 (심플한 선) ---
-            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0)); // 검은색 펜
+            // --- 플랫 버튼 그리기 ---
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0)); 
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
 
-            // 1. 닫기 (X)
             int btnW = BTN_SIZE;
             int right = rcClient.right;
-            MoveToEx(hdc, right - btnW + 8, 8, NULL);
-            LineTo(hdc, right - 8, btnW - 8);
-            MoveToEx(hdc, right - 8, 8, NULL);
-            LineTo(hdc, right - btnW + 8, btnW - 8);
+            
+            // X
+            MoveToEx(hdc, right - btnW + 8, 8, NULL); LineTo(hdc, right - 8, btnW - 8);
+            MoveToEx(hdc, right - 8, 8, NULL); LineTo(hdc, right - btnW + 8, btnW - 8);
 
-            // 2. 확장 (ㅁ)
+            // ㅁ
             int expRight = right - btnW;
             Rectangle(hdc, expRight - btnW + 8, 8, expRight - 8, btnW - 8);
 
-            // 3. 최소화 (_)
+            // _
             int minRight = expRight - btnW;
-            MoveToEx(hdc, minRight - btnW + 8, btnW - 8, NULL);
-            LineTo(hdc, minRight - 8, btnW - 8);
+            MoveToEx(hdc, minRight - btnW + 8, btnW - 8, NULL); LineTo(hdc, minRight - 8, btnW - 8);
 
             SelectObject(hdc, hOldPen);
             DeleteObject(hPen);
 
-            // --- 테두리 그리기 (모던 그레이) ---
-            HBRUSH hBorderBrush = CreateSolidBrush(RGB(100, 100, 100)); // 진한 회색
+            // --- 테두리 & 라인 ---
+            HBRUSH hBorderBrush = CreateSolidBrush(RGB(100, 100, 100)); 
             FrameRect(hdc, &rcClient, hBorderBrush); 
             
-            // 헤더 구분선 (연한 회색)
             RECT rcLine = { 0, BTN_SIZE, rcClient.right, BTN_SIZE + 1 };
             HBRUSH hLineBrush = CreateSolidBrush(RGB(200, 200, 200));
             FillRect(hdc, &rcLine, hLineBrush);
@@ -472,22 +434,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     
+    // 🔥 [디자인 수정] 에디트 컨트롤(메모장) 배경색 변경 (#F3F3F3)
     case WM_CTLCOLOREDIT: { 
         HDC hdcEdit = (HDC)wParam; 
-        SetBkColor(hdcEdit, RGB(255, 255, 255)); 
-        SetTextColor(hdcEdit, RGB(0, 0, 0)); 
-        return (LRESULT)GetStockObject(WHITE_BRUSH); 
+        SetBkColor(hdcEdit, BG_COLOR); 
+        SetTextColor(hdcEdit, RGB(0, 0, 0));
+        // 배경색 브러시를 생성해서 반환 (static을 써서 계속 재사용)
+        static HBRUSH hEditBgBrush = CreateSolidBrush(BG_COLOR);
+        return (LRESULT)hEditBgBrush; 
     }
     case WM_DESTROY: return 0;
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// --- [Event Hook 수정됨] ---
+// --- [Event Hook] ---
 void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
-    // Case 1: 생성 (기존 동일)
     if (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW) {
         if (!IsWindow(hwnd)) return;
         wchar_t className[256];
@@ -498,11 +462,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
                 for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { managed = true; break; }
             }
             if (!managed) {
-                // 탐색기를 Owner(부모)로 지정하여 윈도우가 OS 차원에서 묶이도록 함
                 HWND hNew = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_LAYERED, CLASS_NAME, L"Memo", WS_POPUP | WS_VISIBLE, 
                                            0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT, hwnd, NULL, GetModuleHandle(NULL), NULL);
                 if (hNew) {
-                    // 투명도 결정
                     SetLayeredWindowAttributes(hNew, 0, 200, LWA_ALPHA);
                     UpdateMemoFont(GetDlgItem(hNew, IDC_MEMO_EDIT), DEFAULT_FONT_SIZE);
                     {
@@ -515,21 +477,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
             }
         }
     }
-    // 🔥 [최적화 핵심] Case 2: 숨김 또는 파괴 (Hide OR Destroy)
-    // 탐색기가 닫힐 때 OS는 Hide -> Destroy 순서로 신호를 보냄.
-    // Destroy만 기다리면 늦음. Hide가 오자마자 우리도 같이 숨어야 함.
     else if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) {
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
-            // 이벤트 대상이 내 탐색기이거나, 이미 죽은 탐색기라면
             if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) {
-                
-                // 1. 시각적 즉시 처리 (Visual Feedback)
-                // 메모리 해제고 뭐고 일단 눈앞에서 치움 -> 사용자 체감 속도 0ms
                 ShowWindow(it->hOverlay, SW_HIDE);
-
-                // 2. 리소스 정리 (Cleanup)
-                // 만약 진짜 파괴 이벤트거나 윈도우가 죽었으면 데이터 삭제
                 if (event == EVENT_OBJECT_DESTROY || !IsWindow(it->hExplorer)) {
                     DestroyWindow(it->hOverlay); 
                     it = g_overlays.erase(it); 
@@ -539,13 +491,11 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
             ++it;
         }
     }
-    // Case 3: 위치 변경 등 (기존 동일)
     else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
         if (!IsWindow(hwnd)) return; 
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SyncOverlayPosition(pair); break; }
     }
-    // Case 4: 이름 변경 (기존 동일)
     else if (event == EVENT_OBJECT_NAMECHANGE) {
         if (!IsWindow(hwnd)) return;
         HWND hOverlay = NULL;
@@ -557,14 +507,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
     }
 }
 
-
-
 // --- [Main] ---
 typedef HRESULT (STDAPICALLTYPE *SetProcessDpiAwarenessType)(int);
-// [2.1.3] & [2.2.3] 메인 엔트리 포인트
-// 수정 사항: [Ctrl + A] 기능 추가 (기본 Edit 컨트롤은 이를 지원하지 않아서 강제로 구현)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // 1. DPI 인식 설정
     HMODULE hShCore = LoadLibrary(L"Shcore.dll");
     if (hShCore) {
         auto pSetProcessDpiAwareness = (SetProcessDpiAwarenessType)GetProcAddress(hShCore, "SetProcessDpiAwareness");
@@ -574,41 +519,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    // 2. 윈도우 클래스 등록
     WNDCLASSW wc = { 0 };
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
-    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    // 🔥 [디자인 수정] 기본 배경색을 회색(#F3F3F3)으로 설정
+    wc.hbrBackground = CreateSolidBrush(BG_COLOR); 
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
-    // 3. WinEventHook 설정
     HWINEVENTHOOK hHook1 = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     HWINEVENTHOOK hHook2 = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     HWINEVENTHOOK hHook3 = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     g_hHookObject = hHook1;
 
-    // 4. 메시지 루프 (여기가 수정되었습니다!)
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
-        
-        // 🔥 [기능 추가] Ctrl + A 눌렀을 때 전체 선택 구현
-        // 메시지가 '키 누름'이고, 키가 'A'이며, 'Ctrl'이 눌려있는 상태라면?
         if (msg.message == WM_KEYDOWN && msg.wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-            // 현재 포커스 된 창(메모장)에 "전체 선택(0부터 -1까지)" 명령을 보냄
             SendMessage(msg.hwnd, EM_SETSEL, 0, -1);
-            
-            // 중요: 윈도우의 기본 처리를 막기 위해 루프의 처음으로 돌아감 (안 그러면 '띡' 소리 남)
             continue; 
         }
-
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // 5. 종료 정리
     if (hHook1) UnhookWinEvent(hHook1);
     if (hHook2) UnhookWinEvent(hHook2);
     if (hHook3) UnhookWinEvent(hHook3);
