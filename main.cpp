@@ -561,7 +561,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
         }
     }
     // Case 3: 위치 변경 또는 🔥 [포커스 변경 (FOREGROUND)]
-    // -> 여기서 닫기 딜레이(1초)를 잡습니다.
+    // -> 여기서 닫기 딜레이(1초)를 잡습니다. 
     else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
         
         // 🔥 [Eco-Filter] 포커스 변경 이벤트인데 관리 중인 탐색기가 없다?
