@@ -176,6 +176,21 @@ void CreateEmptyMemo(const std::wstring& folderPath) {
     std::ofstream ofs(p); ofs.close();
 }
 
+// [Helper] 탐색기가 '진짜' 살아있는지(보이는지) 확인하는 함수
+// -> IsWindow는 닫기 애니메이션 중에도 true를 반환하므로,
+// -> IsWindowVisible과 DWM Cloaked 상태까지 확인해야 즉시 반응함.
+bool IsExplorerAlive(HWND hExplorer) {
+    if (!IsWindow(hExplorer)) return false;
+    if (!IsWindowVisible(hExplorer)) return false;
+
+    // DWM에 의해 가려진(Cloaked) 상태인지 확인 (가상 데스크톱 이동, 닫기 애니메이션 등)
+    int isCloaked = 0;
+    DwmGetWindowAttribute(hExplorer, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
+    if (isCloaked != 0) return false;
+
+    return true;
+}
+
 // --- [핵심 함수 2] 위치 동기화 ---
 void SyncOverlayPosition(const OverlayPair& pair) {
     if (!IsWindow(pair.hExplorer)) return;
@@ -499,7 +514,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 // [PRD 2.1.3] & [PRD 4.2.3] 윈도우 이벤트 훅 프로시저
-// -> 탐색기 생성 감지, 숨김, 파괴, 그리고 'Cloaked(닫기 동작)'을 감지하여 오버레이 제어
+// -> 탐색기 생성 감지, 숨김, 파괴, 그리고 '포커스 이동'을 감지하여 오버레이 제어
 void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
@@ -530,18 +545,12 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
             }
         }
     }
-    // Case 2: 숨김, 파괴, 또는 🔥 [Cloaked(닫기/가려짐)] 감지
-    // -> 닫기 버튼을 누르면 DESTROY(파괴) 전에 CLOAKED(가려짐)가 먼저 발생하므로 딜레이 없이 즉시 반응 가능
+    // Case 2: 숨김, 파괴 감지 (기존 HIDE 이벤트 처리 유지 - 1차 방어선)
     else if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_CLOAKED) {
         std::lock_guard<std::mutex> lock(g_overlayMutex);
         for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
-            // 해당 탐색기(hwnd)가 이벤트 대상이거나, 이미 유효하지 않은 핸들인 경우
             if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) {
-                
-                // 1. 일단 즉시 숨김 (시각적 딜레이 제거)
-                ShowWindow(it->hOverlay, SW_HIDE);
-
-                // 2. 파괴 이벤트거나 핸들이 죽었으면 메모장도 삭제
+                ShowWindow(it->hOverlay, SW_HIDE); // 즉시 숨김
                 if (event == EVENT_OBJECT_DESTROY || !IsWindow(it->hExplorer)) {
                     DestroyWindow(it->hOverlay); 
                     it = g_overlays.erase(it); 
@@ -551,16 +560,36 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
             ++it;
         }
     }
-    // Case 3: 위치 변경
+    // Case 3: 위치 변경 또는 🔥 [포커스 변경 (FOREGROUND)]
+    // -> 여기서 닫기 딜레이(1초)를 잡습니다.
     else if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_SYSTEM_FOREGROUND) {
-        if (!IsWindow(hwnd)) return; 
+        
+        // 🔥 [Eco-Filter] 포커스 변경 이벤트인데 관리 중인 탐색기가 없다?
+        // -> CPU 낭비 없이 즉시 리턴 (Zero Cost)
+        if (event == EVENT_SYSTEM_FOREGROUND && g_overlays.empty()) return;
+
+        if (!IsWindow(hwnd) && event == EVENT_OBJECT_LOCATIONCHANGE) return; 
+
         std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (const auto& pair : g_overlays) if (pair.hExplorer == hwnd) { SyncOverlayPosition(pair); break; }
+        for (const auto& pair : g_overlays) {
+            // 위치 동기화 (기존 로직)
+            if (pair.hExplorer == hwnd) {
+                SyncOverlayPosition(pair);
+            }
+
+            // 🔥 [추가된 로직] 포커스가 바뀌었을 때, 내 짝꿍 탐색기 생존 여부 불심검문
+            // -> 탐색기가 닫히는 중(애니메이션)이라면 IsExplorerAlive가 false를 반환함
+            // -> HIDE 이벤트가 늦게 와도 여기서 즉시 숨겨버림
+            if (event == EVENT_SYSTEM_FOREGROUND) {
+                if (!IsExplorerAlive(pair.hExplorer)) {
+                    ShowWindow(pair.hOverlay, SW_HIDE);
+                }
+            }
+        }
     }
     // Case 4: 이름 변경
     else if (event == EVENT_OBJECT_NAMECHANGE) {
         if (!IsWindow(hwnd)) return;
-        // 🔥 [안전장치] 창이 보이지 않거나 닫히는 중이면 스레드 시작하지 않음
         if (!IsWindowVisible(hwnd)) return; 
 
         HWND hOverlay = NULL;
