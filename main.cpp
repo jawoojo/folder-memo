@@ -196,9 +196,9 @@ void SyncOverlayPosition(const OverlayPair& pair) {
     if (hEdit) ShowWindow(hEdit, smallMode ? SW_HIDE : SW_SHOW);
 }
 
-
 // [PRD 3.1.1] 비동기 경로 탐색 (Async Pathfinder)
 // -> 메인 UI 멈춤 방지 및 파일 존재 여부 확인 후 보고
+// -> 🔥 [추가] 로딩 중 탐색기가 닫히면 즉시 감지하여 메모장 강제 종료 (반응 속도 향상)
 void PathFinderThread(HWND hOverlay, HWND hExplorer) {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -206,7 +206,17 @@ void PathFinderThread(HWND hOverlay, HWND hExplorer) {
     
     // [Retry Policy] 탐색기가 초기화될 때까지 최대 5번(1.5초) 시도
     for (int i = 0; i < 5; i++) {
-        if (!IsWindow(hExplorer)) break;
+        // 🔥 [Fast-Fail] 탐색기 윈도우가 사라졌다면(닫힘), 더 기다리지 않고 즉시 종료
+        if (!IsWindow(hExplorer)) {
+            if (IsWindow(hOverlay)) {
+                // 즉시 숨기고 종료 절차 시작
+                ShowWindow(hOverlay, SW_HIDE); 
+                PostMessage(hOverlay, WM_CLOSE, 0, 0);
+            }
+            CoUninitialize();
+            return; 
+        }
+
         foundPath = GetExplorerPath(hExplorer);
         
         if (!foundPath.empty()) break; 
@@ -239,7 +249,7 @@ void PathFinderThread(HWND hOverlay, HWND hExplorer) {
 }
 
 // [PRD 4.0] & [PRD 5.0] 메인 윈도우 프로시저
-// -> UI 업데이트, 페인팅, 입력 처리를 담당
+// -> UI 업데이트, 페인팅, 입력 처리 및 🔥 [안전한 종료 처리] 담당
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     
@@ -257,9 +267,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     pair.fileExists = exists;
                     
                     // [PRD 4.2.2] 파일이 없으면 초기 상태를 '최소화(+)'로 설정
-                    // (주의: 이미 사용자가 작업 중인 상태에서 탐색기 갱신으로 인해 
-                    //  강제로 닫히지 않게 하려면 추가 로직이 필요하지만, 
-                    //  현재는 탐색기 경로 이동/새로고침 시 초기화되는 것이 기본 동작임)
                     pair.isMinimized = !exists; 
 
                     currentFontSize = pair.currentFontSize; 
@@ -272,7 +279,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         
         InvalidateRect(hwnd, NULL, TRUE);
 
-        // 텍스트 로드 또는 초기화
         if (exists && !currentPath.empty()) {
             std::wstring memo = LoadMemo(currentPath);
             SetDlgItemTextW(hwnd, IDC_MEMO_EDIT, memo.c_str());
@@ -319,9 +325,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             }
             
-            // 🔥 [PRD 5.2 최적화] 입력 시 '파일 존재 확인 및 생성 로직' 제거
-            // -> 이제 여기서는 묻지도 따지지도 않고 저장만 합니다.
-            // -> 파일 생성은 오직 '+ 버튼' 클릭 시에만 일어납니다.
+            // [PRD 5.2 최적화] 입력 시 무조건 저장만 수행
             if (!targetPath.empty()) {
                 int len = GetWindowTextLengthW((HWND)lParam);
                 if (len >= 0) {
@@ -373,7 +377,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         DeleteObject(hBgBrush);
 
         if (isMin) {
-            // [PRD 4.2.2] 최소화 아이콘 그리기
             HFONT hIconFont = CreateFontW(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
                 DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Malgun Gothic");
@@ -383,7 +386,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             SetTextColor(hdc, RGB(50, 50, 50)); 
             
             RECT rcIcon = rcClient;
-            // 파일이 있으면 ▤, 없으면 +
             DrawTextW(hdc, hasFile ? L"▤" : L"+", -1, &rcIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             
             SelectObject(hdc, hOldFont);
@@ -394,7 +396,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             DeleteObject(hBorderBrush);
 
         } else {
-            // --- 플랫 버튼 그리기 ---
             HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0)); 
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
 
@@ -444,8 +445,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 std::lock_guard<std::mutex> lock(g_overlayMutex);
                 for (auto& pair : g_overlays) {
                     if (pair.hOverlay == hwnd) { 
-                        // 🔥 [수정] 경로가 비어있으면(홈 등) 아무것도 하지 않고 리턴!
-                        // -> 유령 메모장이 열리는 것을 방지함
+                        // 🔥 [수정] 경로가 비어있으면(홈 등) 무시 (유령 메모장 방지)
                         if (pair.currentPath.empty()) return 0;
 
                         // [PRD 5.1] + 버튼 클릭 시 파일이 없으면 생성
@@ -464,7 +464,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         } else {
             RECT rcClient; GetClientRect(hwnd, &rcClient);
             if (y < BTN_SIZE) { 
-                if (x > rcClient.right - BTN_SIZE) PostQuitMessage(0);
+                if (x > rcClient.right - BTN_SIZE) {
+                    // 🔥 [UI 최적화] 닫기 버튼 누르면 즉시 숨김 처리 후 종료 메시지
+                    ShowWindow(hwnd, SW_HIDE);
+                    PostMessage(hwnd, WM_CLOSE, 0, 0); 
+                }
                 else if (x > rcClient.right - BTN_SIZE * 2) {
                     {
                         std::lock_guard<std::mutex> lock(g_overlayMutex);
@@ -486,6 +490,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     
+    // 🔥 [추가] 닫기 메시지 처리: 즉시 숨기고 파괴
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        DestroyWindow(hwnd);
+        return 0;
+
+    // 🔥 [추가] 파괴 메시지 처리: 전역 벡터에서 안전하게 제거
+    case WM_DESTROY: {
+        std::lock_guard<std::mutex> lock(g_overlayMutex);
+        for (auto it = g_overlays.begin(); it != g_overlays.end(); ++it) {
+            if (it->hOverlay == hwnd) {
+                g_overlays.erase(it);
+                break;
+            }
+        }
+        return 0;
+    }
+
     case WM_CTLCOLOREDIT: { 
         HDC hdcEdit = (HDC)wParam; 
         SetBkColor(hdcEdit, BG_COLOR); 
@@ -493,7 +515,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         static HBRUSH hEditBgBrush = CreateSolidBrush(BG_COLOR);
         return (LRESULT)hEditBgBrush; 
     }
-    case WM_DESTROY: return 0;
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -531,24 +552,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
         }
     }
     // Case 2: 숨김, 파괴, 또는 🔥 [Cloaked(닫기/가려짐)] 감지
-    // -> 닫기 버튼을 누르면 DESTROY(파괴) 전에 CLOAKED(가려짐)가 먼저 발생하므로 딜레이 없이 즉시 반응 가능
+    // -> 탐색기가 사라지면 즉시 오버레이에게 WM_CLOSE를 보내 스스로 종료하도록 유도 (WindowProc에서 벡터 정리)
     else if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_CLOAKED) {
         std::lock_guard<std::mutex> lock(g_overlayMutex);
-        for (auto it = g_overlays.begin(); it != g_overlays.end(); ) {
+        for (const auto& pair : g_overlays) {
             // 해당 탐색기(hwnd)가 이벤트 대상이거나, 이미 유효하지 않은 핸들인 경우
-            if (it->hExplorer == hwnd || !IsWindow(it->hExplorer)) {
-                
+            if (pair.hExplorer == hwnd || !IsWindow(pair.hExplorer)) {
                 // 1. 일단 즉시 숨김 (시각적 딜레이 제거)
-                ShowWindow(it->hOverlay, SW_HIDE);
-
-                // 2. 파괴 이벤트거나 핸들이 죽었으면 메모장도 삭제
-                if (event == EVENT_OBJECT_DESTROY || !IsWindow(it->hExplorer)) {
-                    DestroyWindow(it->hOverlay); 
-                    it = g_overlays.erase(it); 
-                    continue; 
-                }
+                ShowWindow(pair.hOverlay, SW_HIDE);
+                
+                // 2. 종료 메시지 전송 (직접 erase하지 않음 -> WM_DESTROY에서 처리)
+                PostMessage(pair.hOverlay, WM_CLOSE, 0, 0);
             }
-            ++it;
         }
     }
     // Case 3: 위치 변경
@@ -560,7 +575,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd, LONG idO
     // Case 4: 이름 변경
     else if (event == EVENT_OBJECT_NAMECHANGE) {
         if (!IsWindow(hwnd)) return;
-        // 🔥 [안전장치] 창이 보이지 않거나 닫히는 중이면 스레드 시작하지 않음
+        // 창이 보이지 않거나 닫히는 중이면 스레드 시작하지 않음
         if (!IsWindowVisible(hwnd)) return; 
 
         HWND hOverlay = NULL;
