@@ -48,7 +48,7 @@ const int EXPANDED_WIDTH = 600;
 const int EXPANDED_HEIGHT = 900;     
 const int MINIMIZED_SIZE = 50;       // 🔥 [디자인] 최소화 크기 40 -> 50으로 변경
 const int BTN_SIZE = 25;             
-const int DEFAULT_FONT_SIZE = 22;    
+const int DEFAULT_FONT_SIZE = 30;    
 
 
 // 🔥 [디자인] 배경색 정의 (눈이 편한 연회색 #F3F3F3)
